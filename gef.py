@@ -97037,6 +97037,9 @@ class KmallocRetBreakpoint(gdb.Breakpoint):
                 if self.option.filter and name not in self.option.filter:
                     self.enabled = False
                     return False
+                if self.option.process_name != "" and task_name != self.option.process_name:
+                    self.enabled = False
+                    return False
                 name_s = Color.colorify(name, Config.get_gef_setting("theme.heap_chunk_label"))
                 chunk_size_s = Color.colorify("{:<#6x}".format(chunk_size), Config.get_gef_setting("theme.heap_chunk_size"))
                 gef_print("{:s} {:40s}: {:s} (size: {:s} name: {:s})".format(
@@ -97093,6 +97096,8 @@ class KfreeBreakpoint(gdb.Breakpoint):
                     return False
                 if self.option.filter and name not in self.option.filter:
                     return False
+                if self.option.process_name != "" and task_name != self.option.process_name:
+                    return False
                 name_s = Color.colorify(name, Config.get_gef_setting("theme.heap_chunk_label"))
                 chunk_size_s = Color.colorify("{:<#6x}".format(chunk_size), Config.get_gef_setting("theme.heap_chunk_size"))
                 gef_print("{:s} {:40s}: {:s} (size: {:s} name: {:s})".format(
@@ -97123,6 +97128,7 @@ class KmallocTracerCommand(GenericCommand):
     parser.add_argument("-t", "--backtrace", action="store_true", help="display backtrace.")
     parser.add_argument("-d", "--dump-chunk", action="store_true", help="dump the first 0x40 bytes of each chunk.")
     parser.add_argument("-v", "--verbose", action="store_true", help="print meta information.")
+    parser.add_argument("-p", "--process-name", default="", help="filter by specified process name.")
     _syntax_ = parser.format_help()
 
     _example_ = [
@@ -97146,6 +97152,7 @@ class KmallocTracerCommand(GenericCommand):
             "filter": args.filter,
             "dump_chunk": args.dump_chunk,
             "target_task": target_task,
+            "process_name": args.process_name,
         }
         OptionInfo = collections.namedtuple("OptionInfo", dic.keys())
         option_info = OptionInfo(*dic.values())
