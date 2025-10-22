@@ -6765,7 +6765,6 @@ class ARM(Architecture):
             taken, reason = not carry, "!C"
         return taken, reason
 
-    __SCR_available = None
     __mode_dic = {
         # encoding: [mode, PL]
         0b10000: ["User", 0],
@@ -6791,17 +6790,12 @@ class ARM(Architecture):
         key = val & 0b11111
         CurrentMode, CurrentPL = self.__mode_dic[key]
 
-        if self.__SCR_available is False: # for speed up
+        if not is_support_secure_world():
             mode = " [Mode={:s}({:#07b},PL{:d})]".format(CurrentMode, key, CurrentPL)
         else:
             scr = get_register("$SCR")
-            if scr is not None:
-                self.__SCR_available = True
-                secure_state = ["Secure", "Non-Secure"][scr & 1]
-                mode = " [Mode={:s}({:#07b},PL{:d}),{:s}]".format(CurrentMode, key, CurrentPL, secure_state)
-            else:
-                self.__SCR_available = False
-                mode = " [Mode={:s}({:#07b},PL{:d})]".format(CurrentMode, key, CurrentPL)
+            secure_state = ["Secure", "Non-Secure"][scr & 1]
+            mode = " [Mode={:s}({:#07b},PL{:d}),{:s}]".format(CurrentMode, key, CurrentPL, secure_state)
         return Architecture.flags_to_human(val, self.flags_table) + mode
 
     def get_ra(self, insn, frame):
@@ -6823,7 +6817,9 @@ class ARM(Architecture):
         return ra
 
     def get_tls(self):
-        if is_in_kernel() or is_rr():
+        if is_in_kernel() or is_in_secure():
+            return None
+        if is_rr(): # unsupported ExecAsm when rr
             return None
         if self.is_thumb():
             codes = [b"\x1d\xee", b"\x70\x2f"] # mrc p15, #0, r2, c13, c0, #3
@@ -6922,30 +6918,22 @@ class AARCH64(ARM):
 
     # is_branch_taken is the same as ARM
 
-    __SCR_EL3_available = None
-
     def flag_register_to_human(self, val=None):
         # http://events.linuxfoundation.org/sites/events/files/slides/KoreaLinuxForum-2014.pdf
         if val is None:
             reg = self.flag_register
             val = get_register(reg) & 0xffff_ffff
 
-        if self.__SCR_EL3_available is False: # for speed up
+        if not is_support_secure_world():
             mode = " [EL={:d},SP={:d}]".format((val >> 2) & 0b11, val & 0b11)
         else:
             scr = get_register("$SCR_EL3")
-            if scr is not None:
-                self.__SCR_EL3_available = True
-                secure_state = ["Secure", "Non-Secure"][scr & 1]
-                mode = " [EL={:d},SP={:d},{:s}]".format((val >> 2) & 0b11, val & 0b11, secure_state)
-            else:
-                self.__SCR_EL3_available = False
-                mode = " [EL={:d},SP={:d}]".format((val >> 2) & 0b11, val & 0b11)
-
+            secure_state = ["Secure", "Non-Secure"][scr & 1]
+            mode = " [EL={:d},SP={:d},{:s}]".format((val >> 2) & 0b11, val & 0b11, secure_state)
         return Architecture.flags_to_human(val, self.flags_table) + mode
 
     def get_tls(self):
-        if is_in_kernel():
+        if is_in_kernel() or is_in_secure():
             return None
 
         tls = get_register("$TPIDR_EL0") # qemu-user + gdb-multiarch
@@ -6956,6 +6944,8 @@ class AARCH64(ARM):
         if tls is not None:
             return tls
 
+        if is_rr(): # unsupported ExecAsm when rr
+            return None
         codes = [b"\x40\xd0\x3b\xd5"] # mrs x0, tpidr_el0
         ret = ExecAsm(codes).exec_code()
         return ret["reg"]["$x0"]
@@ -7153,8 +7143,10 @@ class X86(Architecture):
         fs = get_register("$fs_base")
         if fs is not None:
             return fs
+        if is_rr(): # unsupported ptrace and ExecAsm when rr
+            return None
         # fast path
-        if not is_remote_debug() and not is_in_kernel() and not is_qiling() and not is_rr():
+        if not is_remote_debug() and not is_in_kernel() and not is_qiling():
             PTRACE_ARCH_PRCTL = 30
             ARCH_GET_FS = 0x1003
             pid, lwpid, tid = gdb.selected_thread().ptid
@@ -7166,7 +7158,7 @@ class X86(Architecture):
             if ret == 0: # success
                 return value.contents.value or 0
         # slow path
-        if not is_kvm_enabled() and not is_qiling() and not is_rr():
+        if not is_kvm_enabled() and not is_qiling():
             codes = [b"\x64\xa1\x00\x00\x00\x00"] # mov eax, dword ptr fs:[0x0]
             ret = ExecAsm(codes).exec_code()
             return ret["reg"]["$eax"]
@@ -7177,8 +7169,10 @@ class X86(Architecture):
         gs = get_register("$gs_base")
         if gs is not None:
             return gs
+        if is_rr(): # unsupported ptrace and ExecAsm when rr
+            return None
         # fast path
-        if not is_remote_debug() and not is_in_kernel() and not is_qiling() and not is_rr():
+        if not is_remote_debug() and not is_in_kernel() and not is_qiling():
             PTRACE_ARCH_PRCTL = 30
             ARCH_GET_GS = 0x1004
             pid, lwpid, tid = gdb.selected_thread().ptid
@@ -7190,7 +7184,7 @@ class X86(Architecture):
             if ret == 0: # success
                 return value.contents.value or 0
         # slow path
-        if not is_kvm_enabled() and not is_qiling() and not is_rr():
+        if not is_kvm_enabled() and not is_qiling():
             codes = [b"\x65\xa1\x00\x00\x00\x00"] # mov eax, dword ptr gs:[0x0]
             ret = ExecAsm(codes).exec_code()
             return ret["reg"]["$eax"]
@@ -7305,8 +7299,10 @@ class X86_64(X86):
         fs = get_register("$fs_base")
         if fs is not None:
             return fs
+        if is_rr(): # unsupported ptrace and ExecAsm when rr
+            return None
         # fast path
-        if not is_remote_debug() and not is_in_kernel() and not is_qiling() and not is_rr():
+        if not is_remote_debug() and not is_in_kernel() and not is_qiling():
             PTRACE_ARCH_PRCTL = 30
             ARCH_GET_FS = 0x1003
             _pid, lwpid, _tid = gdb.selected_thread().ptid
@@ -7318,7 +7314,7 @@ class X86_64(X86):
             if ret == 0: # success
                 return value.contents.value or 0
         # slow path
-        if not is_kvm_enabled() and not is_qiling() and not is_rr():
+        if not is_kvm_enabled() and not is_qiling():
             codes = [b"\x64\x48\xa1\x00\x00\x00\x00\x00\x00\x00\x00"] # movabs rax, qword ptr fs:[0x0]
             ret = ExecAsm(codes).exec_code()
             return ret["reg"]["$rax"]
@@ -7329,8 +7325,10 @@ class X86_64(X86):
         gs = get_register("$gs_base")
         if gs is not None:
             return gs
+        if is_rr(): # unsupported ptrace and ExecAsm when rr
+            return None
         # fast path
-        if not is_remote_debug() and not is_in_kernel() and not is_qiling() and not is_rr():
+        if not is_remote_debug() and not is_in_kernel() and not is_qiling():
             PTRACE_ARCH_PRCTL = 30
             ARCH_GET_GS = 0x1004
             _pid, lwpid, _tid = gdb.selected_thread().ptid
@@ -7342,7 +7340,7 @@ class X86_64(X86):
             if ret == 0: # success
                 return value.contents.value or 0
         # slow path
-        if not is_kvm_enabled() and not is_qiling() and not is_rr():
+        if not is_kvm_enabled() and not is_qiling():
             codes = [b"\x65\x48\xa1\x00\x00\x00\x00\x00\x00\x00\x00"] # movabs rax, qword ptr gs:[0x0]
             ret = ExecAsm(codes).exec_code()
             return ret["reg"]["$rax"]
@@ -12204,11 +12202,15 @@ def is_in_kernel():
             return False
         return (cs & 0b11) != 3
     elif is_arm32():
+        if is_in_secure():
+            return False
         cpsr = get_register(current_arch.flag_register)
         if cpsr is None:
             return False
         return (cpsr & 0b11111) not in [0b10000, 0b11010]
     elif is_arm64():
+        if is_in_secure():
+            return False
         cpsr = get_register(current_arch.flag_register)
         if cpsr is None:
             return False
@@ -12220,6 +12222,33 @@ def is_in_kernel():
         return priv == 1
     # All other architectures are considered userland.
     return False
+
+
+@Cache.cache_this_session
+def is_support_secure_world():
+    if not is_arm32() and not is_arm64():
+        return False
+    if not is_qemu_system():
+        return False
+    ret = gdb.execute("monitor info mtree -f", to_string=True)
+    return ".secure-ram" in ret
+
+
+@Cache.cache_until_next
+def is_in_secure():
+    """GDB mode determination function for secure world."""
+    if not is_support_secure_world():
+        return False
+    if is_arm32():
+        scr = get_register("$SCR")
+    elif is_arm64():
+        scr = get_register("$SCR_EL3")
+    # In environments without a secure world:
+    # Older qemu versions did not have the SCR register. (return None)
+    # Newer qemu versions always return 0.
+    if not scr:
+        return False
+    return (scr & 0b1) == 0
 
 
 @Cache.cache_this_session
@@ -18055,7 +18084,7 @@ class SearchPatternCommand(GenericCommand):
         return
 
     def get_process_maps_qemu_system(self):
-        res = PageMap.get_page_maps_by_pagewalk("pagewalk --quiet --no-pager")
+        res = PageMap.get_page_maps_by_pagewalk("pagewalk --quiet --no-pager --disable-color")
         res = sorted(set(res.splitlines()))
         res = list(filter(lambda line: line.endswith("]"), res))
         res = list(filter(lambda line: "[+]" not in line, res))
@@ -19274,7 +19303,7 @@ class ReadSystemRegisterCommand(GenericCommand):
     """Read system register for old qemu-system-arm."""
 
     _cmdline_ = "read-system-register"
-    _category_ = "04-a. Register - View"
+    _category_ = "08-b. Qemu-system Cooperation - Register"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("reg_name", metavar="REGISTER_NAME", help="register name to read a value.")
@@ -25465,7 +25494,7 @@ class KernelChecksecCommand(GenericCommand):
     """Checksec the security properties of the current kernel."""
 
     _cmdline_ = "kchecksec"
-    _category_ = "08-b. Qemu-system Cooperation - Linux Basic"
+    _category_ = "08-c. Qemu-system Cooperation - Linux Basic"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     _syntax_ = parser.format_help()
@@ -25711,7 +25740,7 @@ class KernelChecksecCommand(GenericCommand):
                 additional = "pti=on is in cmdline"
                 gef_print("{:<40s}: {:s} ({:s})".format(cfg, Color.colorify("Enabled", "bold green"), additional))
             elif is_in_kernel():
-                lines = PageMap.get_page_maps_by_pagewalk("pagewalk --quiet --no-pager --simple").splitlines()
+                lines = PageMap.get_page_maps_by_pagewalk("pagewalk --quiet --no-pager --simple --disable-color").splitlines()
                 for line in lines:
                     if "USER" in line and "R-X" in line:
                         # If the qemu startup option does not include `-cpu kvm64`,
@@ -26360,6 +26389,17 @@ class KernelChecksecCommand(GenericCommand):
             gef_print("{:<40s}: {:s} ({:s})".format(cfg, Color.colorify("Disabled", "bold green"), additional))
         return
 
+    def check_CONFIG_DEBUG_INFO_BTF(self):
+        cfg = "CONFIG_DEBUG_INFO_BTF"
+        __start_BTF = Symbol.get_ksymaddr("__start_BTF")
+        if __start_BTF:
+            additional = "__start_BTF: Found"
+            gef_print("{:<40s}: {:s} ({:s})".format(cfg, Color.colorify("Enabled", "bold red"), additional))
+        else:
+            additional = "__start_BTF: Not found"
+            gef_print("{:<40s}: {:s} ({:s})".format(cfg, Color.colorify("Disabled", "bold green"), additional))
+        return
+
     def check_CONFIG_RANDSTRUCT(self):
         cfg = "CONFIG_RANDSTRUCT"
         # In cases where kallsyms could be resolved, but ksysctl could not be resolved correctly,
@@ -26651,6 +26691,7 @@ class KernelChecksecCommand(GenericCommand):
         gef_print(titlify("Other"))
         self.check_CONFIG_KALLSYMS_ALL()
         self.check_CONFIG_IKCONFIG()
+        self.check_CONFIG_DEBUG_INFO_BTF()
         self.check_CONFIG_RANDSTRUCT()
         self.check_CONFIG_STATIC_USERMODEHELPER()
         self.check_CONFIG_STACKPROTECTOR()
@@ -33870,7 +33911,7 @@ class VMMapCommand(GenericCommand, BufferingOutput):
                 return
 
             info("Redirect to pagewalk (args are ignored)")
-            gdb.execute("pagewalk")
+            gdb.execute("pagewalk --quiet")
             return
 
         if args.outer and not is_qemu_user():
@@ -49457,12 +49498,6 @@ class Syscall:
 
 def get_syscall_table(arch=None, mode=None):
 
-    def is_secure():
-        scr = get_register("$SCR" if is_arm32() else "$SCR_EL3")
-        if scr is None:
-            return False
-        return (scr & 0b1) == 0
-
     if arch is None and mode is None :
         if is_x86_64():
             arch, mode = "X86", "64"
@@ -49472,12 +49507,12 @@ def get_syscall_table(arch=None, mode=None):
             else:
                 arch, mode = "X86", "Native-32"
         elif is_arm64():
-            if is_secure():
+            if is_in_secure():
                 arch, mode = "ARM64", "Secure-World"
             else:
                 arch, mode = "ARM64", "ARM"
         elif is_arm32():
-            if is_secure():
+            if is_in_secure():
                 arch, mode = "ARM", "Secure-World"
             elif is_emulated32():
                 arch, mode = "ARM", "Emulated-32"
@@ -50154,7 +50189,7 @@ class KernelMagicCommand(GenericCommand):
     """Display useful kernel addresses and offsets."""
 
     _cmdline_ = "kmagic"
-    _category_ = "08-b. Qemu-system Cooperation - Linux Basic"
+    _category_ = "08-c. Qemu-system Cooperation - Linux Basic"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("filter", metavar="FILTER", nargs="*", help="filter string.")
@@ -52346,7 +52381,7 @@ class ConvertCommand(GenericCommand, BufferingOutput):
             self.out.append("unhex:          {!s}".format(value))
             value_null = b"\x00".join(slicer(value, 1)) + b"\x00"
             self.out.append("unhex w/NULL:   {!s}".format(value_null))
-        except binascii.Error:
+        except (binascii.Error, ValueError):
             pass
         return
 
@@ -52358,6 +52393,31 @@ class ConvertCommand(GenericCommand, BufferingOutput):
             self.out.append(titlify("byteswap"))
             self.out.append("byteswap-64:    {:#018x}".format(converted64))
             self.out.append("byteswap-32:    {:#010x}".format(converted32))
+        except ValueError:
+            pass
+        return
+
+    def bit_reverse(self, value):
+        def bit_reverse(x, n):
+            mask = (1 << n) - 1
+            b = "{:0{:d}b}".format(x & mask, n)
+            return int(b[::-1], 2)
+
+        try:
+            value = int(value, 0)
+            br8 = bit_reverse(value, 8)
+            br16 = bit_reverse(value, 16)
+            br32 = bit_reverse(value, 32)
+            br64 = bit_reverse(value, 64)
+            self.out.append(titlify("bit-reverse"))
+            self.out.append("bit-reverse8:   {:#04x}".format(br8))
+            self.out.append("bit-reverse16:  {:#06x}".format(br16))
+            self.out.append("bit-reverse32:  {:#010x}".format(br32))
+            self.out.append("bit-reverse64:  {:#018x}".format(br64))
+            bl = (value.bit_length() + 3) // 4 * 4
+            if bl > 64:
+                brN = bit_reverse(value, bl)
+                self.out.append("bit-reverse:    {:#0{:d}x}".format(brN, bl // 4 + 2))
         except ValueError:
             pass
         return
@@ -52411,6 +52471,28 @@ class ConvertCommand(GenericCommand, BufferingOutput):
             pass
         return
 
+    def url_encode(self, value):
+        try:
+            import urllib.parse
+            s = urllib.parse.quote(value)
+            if s != value:
+                self.out.append(titlify("URL-encode"))
+                self.out.append("URL-encode:     {:s}".format(s))
+        except Exception:
+            pass
+        return
+
+    def url_decode(self, value):
+        try:
+            import urllib.parse
+            s = urllib.parse.unquote(value)
+            if s != value:
+                self.out.append(titlify("URL-decode"))
+                self.out.append("URL-decode:     {:s}".format(s))
+        except Exception:
+            pass
+        return
+
     def unhex_xor(self, value):
         try:
             if value.startswith("0x"):
@@ -52424,7 +52506,7 @@ class ConvertCommand(GenericCommand, BufferingOutput):
                     self.out.append("xor-{:02X}({:s}):      {!s}".format(i, chr(i), xored))
                 else:
                     self.out.append("xor-{:02X}:         {!s}".format(i, xored))
-        except binascii.Error:
+        except (binascii.Error, ValueError):
             pass
         return
 
@@ -52441,7 +52523,7 @@ class ConvertCommand(GenericCommand, BufferingOutput):
                     self.out.append("add-{:02X}({:s}):      {!s}".format(i, chr(i), added))
                 else:
                     self.out.append("add-{:02X}:         {!s}".format(i, added))
-        except binascii.Error:
+        except (binascii.Error, ValueError):
             pass
         return
 
@@ -52455,7 +52537,7 @@ class ConvertCommand(GenericCommand, BufferingOutput):
             for i in range(9):
                 rored = b"".join(bytes([((x << i) | x >> (8 - i)) & 0xff]) for x in value)
                 self.out.append("rol-{:02X}:         {!s}".format(i, rored))
-        except binascii.Error:
+        except (binascii.Error, ValueError):
             pass
         return
 
@@ -52501,7 +52583,7 @@ class ConvertCommand(GenericCommand, BufferingOutput):
                             x += ord("a") - 1
                     slided.append(x)
                 self.out.append("caesar-{:02d}:      {!s}".format(i, bytes(slided)))
-        except binascii.Error:
+        except (binascii.Error, ValueError):
             pass
         return
 
@@ -52591,9 +52673,12 @@ class ConvertCommand(GenericCommand, BufferingOutput):
         self.tohex(value)
         self.unhex(value)
         self.byteswap(value)
+        self.bit_reverse(value)
         self.integer(value)
         self.signed(value)
         self.string(value)
+        self.url_encode(value)
+        self.url_decode(value)
 
         if args.verbose:
             self.unhex_xor(value)
@@ -53073,7 +53158,7 @@ class KernelAddressHeuristicFinder:
     @staticmethod
     @switch_to_intel_syntax
     def get_saved_command_line():
-        # Do not use Symbol.get_ksymaddr directry since this function is used to discover KPTI.
+        # Do not use Symbol.get_ksymaddr directory since this function is used to discover KPTI.
         # This is because Symbol.get_ksymaddr uses a cache.
 
         kversion = Kernel.kernel_version()
@@ -55627,76 +55712,46 @@ class KernelAddressHeuristicFinder:
                 return x
 
         kversion = Kernel.kernel_version()
+        if kversion >= "6.9":
+            return None
 
-        def is_looped_link_list(x):
-            seen = []
-            while True:
-                if not is_valid_addr(x):
-                    return False
-                if len(seen) > 1 and x in seen[1:]:
-                    return False
-                if len(seen) > 0 and x == seen[0]:
-                    return True
-                seen.append(x)
-                x = read_int_from_memory(x)
+        # plan 2 (from register_vmap_purge_notifier)
+        addr = Symbol.get_ksymaddr("register_vmap_purge_notifier")
+        if addr:
+            res = gdb.execute("x/10i {:#x}".format(addr), to_string=True)
+            if is_x86_64():
+                g = KernelAddressHeuristicFinderUtil.x64_x86_mov_reg_const(res)
+                """
+                x86 or x64
+                vmap_notify_list     # rarely leads to long lists
+                free_vmap_area_list  <- here (false positive)
+                vmap_area_list       <- here
+                """
+            elif is_x86_32():
+                g = KernelAddressHeuristicFinderUtil.x64_x86_mov_reg_const(res)
+            elif is_arm64():
+                g = KernelAddressHeuristicFinderUtil.aarch64_adrp_add(res)
+                """
+                arm32 or arm64
 
-        # plan 2 (available v3.10 ~ v6.3: vread, v6.4~: vread_iter)
-        if kversion and kversion >= "3.17":
-            addr = Symbol.get_ksymaddr("vread") or Symbol.get_ksymaddr("vread_iter")
-            if addr:
-                res = gdb.execute("x/100i {:#x}".format(addr), to_string=True)
-                if is_x86_64():
-                    g = KernelAddressHeuristicFinderUtil.x64_x86_cmp_const(res, read_valid=True)
-                elif is_x86_32():
-                    g = KernelAddressHeuristicFinderUtil.x64_x86_cmp_const(res, read_valid=True)
-                elif is_arm64():
-                    g = KernelAddressHeuristicFinderUtil.aarch64_adrp_add_ldr(res)
-                elif is_arm32():
-                    g = itertools.chain(
-                        KernelAddressHeuristicFinderUtil.arm32_movw_movt(res),
-                        KernelAddressHeuristicFinderUtil.arm32_ldr_pc_relative(res),
-                    )
-                for x in g:
-                    if is_looped_link_list(x):
-                        return x
-
-        # plan 3 (available v4.10~)
-        if kversion and kversion >= "4.10":
-            addrs = Symbol.get_ksymaddr_multiple("s_next")
-            if addrs:
-                for s_next in addrs:
-                    res = gdb.execute("x/20i {:#x}".format(s_next), to_string=True)
-                    if is_x86_64():
-                        g = KernelAddressHeuristicFinderUtil.x64_x86_mov_reg_const(res, "rsi")
-                    elif is_x86_32():
-                        g = KernelAddressHeuristicFinderUtil.x64_x86_mov_reg_const(res, "e.x")
-                    elif is_arm64():
-                        g = KernelAddressHeuristicFinderUtil.aarch64_adrp_add_add(res, read_valid=True)
-                    elif is_arm32():
-                        g = KernelAddressHeuristicFinderUtil.arm32_ldr_pc_relative(res)
-                    for x in g:
-                        if is_looped_link_list(x):
-                            return x
-
-        # plan 4 (available v2.6.28 ~ v5.1)
-        if kversion and kversion >= "2.6.28" and kversion < "5.2":
-            addr = Symbol.get_ksymaddr("__insert_vmap_area")
-            if addr:
-                res = gdb.execute("x/100i {:#x}".format(addr), to_string=True)
-                if is_x86_64():
-                    g = KernelAddressHeuristicFinderUtil.x64_qword_ptr_rip_base(res, read_valid=True)
-                elif is_x86_32():
-                    g = KernelAddressHeuristicFinderUtil.x86_dword_ptr_ds(res, read_valid=True)
-                elif is_arm64():
-                    g = KernelAddressHeuristicFinderUtil.aarch64_adrp_add_ldr(res)
-                elif is_arm32():
-                    g = itertools.chain(
-                        KernelAddressHeuristicFinderUtil.arm32_movw_movt(res),
-                        KernelAddressHeuristicFinderUtil.arm32_ldr_pc_relative(res),
-                    )
-                for x in g:
-                    if is_looped_link_list(x):
-                        return x
+                [~v6.8]
+                vmap_notify_list     # rarely leads to long lists
+                vmap_area_list       <- here
+                free_vmap_area_list
+                """
+            elif is_arm32():
+                g = KernelAddressHeuristicFinderUtil.arm32_movw_movt(res)
+            for x in g:
+                if is_x86():
+                    count = 0
+                else:
+                    count = 1
+                for i in range(16):
+                    a = x + current_arch.ptrsize * i
+                    if is_double_link_list(a, min_len=10):
+                        count += 1
+                    if count == 2:
+                        return a
         return None
 
     @staticmethod
@@ -55709,39 +55764,56 @@ class KernelAddressHeuristicFinder:
                 return x
 
         kversion = Kernel.kernel_version()
+        if kversion < "5.2":
+            return None
 
-        # plan 2 (from get_vmap_area_list; v5.2~)
-        if kversion and kversion >= "5.2":
-            if kversion >= "5.4":
-                offset_list = current_arch.ptrsize * 5 # offsetof(struct vmap_area, list)
-            elif kversion >= "5.2":
-                offset_list = current_arch.ptrsize * 7 # offsetof(struct vmap_area, list)
+        # plan 2 (from register_vmap_purge_notifier)
+        addr = Symbol.get_ksymaddr("register_vmap_purge_notifier")
+        if addr:
+            res = gdb.execute("x/10i {:#x}".format(addr), to_string=True)
+            if is_x86_64():
+                g = KernelAddressHeuristicFinderUtil.x64_x86_mov_reg_const(res)
+                """
+                x86 or x64
 
-            bits = AddressUtil.get_memory_alignment(in_bits=True)
-            vend = (1 << bits) - 1
+                [~v6.8]
+                vmap_notify_list     # rarely leads to long lists
+                free_vmap_area_list  <- here
+                vmap_area_list
 
-            if is_x86():
-                direction = -1
-            elif is_arm64() or is_arm32():
-                direction = 1
+                [v6.9~]
+                vmap_notify_list     # rarely leads to long lists
+                free_vmap_area_list  <- here
+                """
+            elif is_x86_32():
+                g = KernelAddressHeuristicFinderUtil.x64_x86_mov_reg_const(res)
+            elif is_arm64():
+                g = KernelAddressHeuristicFinderUtil.aarch64_adrp_add(res)
+                """
+                arm32 or arm64
 
-            vmap_area_list = KernelAddressHeuristicFinder.get_vmap_area_list()
-            if vmap_area_list:
-                for i in range(2, 16): # 2: sizeof(list_head) / sizeof(long)
-                    x = vmap_area_list + current_arch.ptrsize * i * direction
-                    y = read_int_from_memory(x)
-                    z = read_int_from_memory(x + current_arch.ptrsize)
-                    if not is_valid_addr(y) or not is_valid_addr(z):
-                        continue
-                    ydata = read_int_from_memory(y - offset_list)
-                    zdata = read_int_from_memory(z - offset_list)
-                    if ydata == 0 or zdata == 0:
-                        continue
-                    if ydata != 1 and (ydata & 0xfff) != 0:
-                        continue
-                    if zdata != vend and (zdata & 0xfff) != 0:
-                        continue
-                    return x
+                [~v6.8]
+                vmap_notify_list     # rarely leads to long lists
+                vmap_area_list       <- here (false positive)
+                free_vmap_area_list  <- here
+
+                [v6.9~]
+                vmap_notify_list     # rarely leads to long lists
+                free_vmap_area_list  <- here
+                """
+            elif is_arm32():
+                g = KernelAddressHeuristicFinderUtil.arm32_movw_movt(res)
+            for x in g:
+                if kversion < "6.9" and (is_arm32() or is_arm64()):
+                    count = 0
+                else:
+                    count = 1
+                for i in range(16):
+                    a = x + current_arch.ptrsize * i
+                    if is_double_link_list(a, min_len=10):
+                        count += 1
+                    if count == 2:
+                        return a
         return None
 
     @staticmethod
@@ -56276,7 +56348,7 @@ class Kernel:
     @Cache.cache_until_next
     def get_maps():
         maps = []
-        res = PageMap.get_page_maps_by_pagewalk("pagewalk --quiet --no-pager --simple")
+        res = PageMap.get_page_maps_by_pagewalk("pagewalk --quiet --no-pager --simple --disable-color")
         res = sorted(set(res.splitlines()))
         res = list(filter(lambda line: line.endswith("]"), res))
         res = list(filter(lambda line: "[+]" not in line, res))
@@ -56725,7 +56797,7 @@ class KernelbaseCommand(GenericCommand):
     """Display kernel base address."""
 
     _cmdline_ = "kbase"
-    _category_ = "08-b. Qemu-system Cooperation - Linux Basic"
+    _category_ = "08-c. Qemu-system Cooperation - Linux Basic"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-r", "--rescan", action="store_true", help="do not use cache.")
@@ -56771,7 +56843,7 @@ class KernelVersionCommand(GenericCommand):
     """Display kernel version string."""
 
     _cmdline_ = "kversion"
-    _category_ = "08-b. Qemu-system Cooperation - Linux Basic"
+    _category_ = "08-c. Qemu-system Cooperation - Linux Basic"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-r", "--rescan", action="store_true", help="do not use cache.")
@@ -56805,7 +56877,7 @@ class KernelCmdlineCommand(GenericCommand):
     """Display kernel cmdline string."""
 
     _cmdline_ = "kcmdline"
-    _category_ = "08-b. Qemu-system Cooperation - Linux Basic"
+    _category_ = "08-c. Qemu-system Cooperation - Linux Basic"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-r", "--rescan", action="store_true", help="do not use cache.")
@@ -56839,7 +56911,7 @@ class KernelCurrentCommand(GenericCommand):
     """Display current task."""
 
     _cmdline_ = "kcurrent"
-    _category_ = "08-b. Qemu-system Cooperation - Linux Basic"
+    _category_ = "08-c. Qemu-system Cooperation - Linux Basic"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-q", "--quiet", action="store_true", help="enable quiet mode.")
@@ -56984,12 +57056,14 @@ class KernelTaskCommand(GenericCommand, BufferingOutput):
     """Display process list."""
 
     _cmdline_ = "ktask"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-f. Qemu-system Cooperation - Linux Task"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ascii diagram.")
     parser.add_argument("-f", "--filter", action="append", type=re.compile, default=[],
-                        help="REGEXP filter.")
+                        help="comm string REGEXP filter.")
+    parser.add_argument("-T", "--task-filter", action="append", type=AddressUtil.parse_address, default=[],
+                        help="task address filter.")
     parser.add_argument("-m", "--print-maps", action="store_true",
                         help="print memory map for each user-land process.")
     parser.add_argument("-r", "--print-regs", action="store_true",
@@ -58490,7 +58564,7 @@ class KernelTaskCommand(GenericCommand, BufferingOutput):
             else:
                 offset_vm_flags = offset_vm_mm + 4 * 2
         elif is_arm32():
-            ret = gdb.execute("pagewalk -n", to_string=True)
+            ret = gdb.execute("pagewalk --no-pager --disable-color", to_string=True)
             if "using long description" in ret:
                 offset_vm_flags = offset_vm_mm + 8 * 2
             else:
@@ -58498,45 +58572,35 @@ class KernelTaskCommand(GenericCommand, BufferingOutput):
         return offset_vm_flags
 
     def get_offset_vm_file(self, task_addrs, offset_mm, offset_vm_flags):
-        for task in task_addrs:
-            mm = read_int_from_memory(task + offset_mm)
-            if mm == 0:
-                continue
-
-            vm_area_struct, _ = self.get_vm_area_struct(mm)
-            current = vm_area_struct + offset_vm_flags
-
-            # now, `current` points vm_flags
-            current += current_arch.ptrsize
-            if is_32bit():
-                mask = Kernel.get_kernel_base().text_base & 0xf000_0000
-            elif is_x86_64():
-                cr4 = get_register("cr4", use_monitor=True)
-                if (cr4 >> 12) & 1:
-                    mask = 0xff00_0000_0000_0000 # level 5 pagetable
-                else:
-                    mask = 0xffff_0000_0000_0000 # level 4 pagetable
-            else:
-                mask = 0xffff_0000_0000_0000
-            while True:
-                x = read_int_from_memory(current)
-                if not is_valid_addr(x):
-                    current += current_arch.ptrsize
+        for i in range(50):
+            found = True
+            for task in task_addrs:
+                mm = read_int_from_memory(task + offset_mm)
+                if mm == 0:
                     continue
 
-                y = read_int_from_memory(current + current_arch.ptrsize) # read one unit ahead
-                if not is_valid_addr(y):
-                    current += current_arch.ptrsize
-                    continue
-
-                if (x & mask) == (y & mask) == mask and x == y: # search for anon_vma_chain
+                vm_area_struct, _ = self.get_vm_area_struct(mm)
+                ptr_anon_vma_chain = vm_area_struct + offset_vm_flags + current_arch.ptrsize * i
+                if not is_double_link_list(ptr_anon_vma_chain):
+                    found = False
                     break
-                current += current_arch.ptrsize
-
-            # now, `current` points anon_vma_chain
-            offset_anon_vma_chain = current - vm_area_struct
-            offset_vm_file = offset_anon_vma_chain + current_arch.ptrsize * 5
-            return offset_vm_file
+                ptr_anon_vma = vm_area_struct + offset_vm_flags + current_arch.ptrsize * (i + 2)
+                anon_vma = read_int_from_memory(ptr_anon_vma)
+                if anon_vma != 0 and not is_valid_addr(anon_vma): # allow NULL
+                    found = False
+                    break
+                ptr_vm_ops = vm_area_struct + offset_vm_flags + current_arch.ptrsize * (i + 3)
+                vm_ops = read_int_from_memory(ptr_vm_ops)
+                if not is_valid_addr(vm_ops):
+                    found = False
+                    break
+                ptr_vm_file = vm_area_struct + offset_vm_flags + current_arch.ptrsize * (i + 5)
+                vm_file = read_int_from_memory(ptr_vm_file)
+                if not is_valid_addr(vm_file):
+                    found = False
+                    break
+            if found:
+                return offset_vm_flags + current_arch.ptrsize * (i + 5)
         return None
 
     def get_mm(self, task, offset_mm):
@@ -59245,6 +59309,8 @@ class KernelTaskCommand(GenericCommand, BufferingOutput):
             self.quiet_info("offsetof(file, f_path.dentry): {:#x}".format(self.offset_dentry))
 
             if self.offset_d_iname is None:
+                mm = read_int_from_memory(task_addrs[1] + self.offset_mm)
+                current, _ = self.get_vm_area_struct(mm)
                 vm_file = read_int_from_memory(current + self.offset_vm_file)
                 dentry = read_int_from_memory(vm_file + self.offset_dentry)
                 self.offset_d_iname = self.get_offset_d_iname(dentry)
@@ -59525,6 +59591,10 @@ class KernelTaskCommand(GenericCommand, BufferingOutput):
                 if not any(re_pattern.search(comm_string) for re_pattern in self.args.filter):
                     continue
 
+            if self.args.task_filter:
+                if task not in self.args.task_filter:
+                    continue
+
             kstack = read_int_from_memory(task + self.offset_stack)
             pid = read_int32_from_memory(task + self.offset_pid)
             cred = read_int_from_memory(task + self.offset_cred)
@@ -59771,7 +59841,7 @@ class KernelFilesCommand(GenericCommand):
     """Display open files list of each process (shortcut for `ktask -quF`)."""
 
     _cmdline_ = "kfiles"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-f. Qemu-system Cooperation - Linux Task"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use less.")
@@ -59797,7 +59867,7 @@ class KernelSavedRegsCommand(GenericCommand):
     """Display saved registers of each process (shortcut for `ktask -qur`)."""
 
     _cmdline_ = "kregs"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-f. Qemu-system Cooperation - Linux Task"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use less.")
@@ -59823,7 +59893,7 @@ class KernelSignalsCommand(GenericCommand):
     """Display signal handlers of each process (shortcut for `ktask -qus`)."""
 
     _cmdline_ = "ksighands"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-f. Qemu-system Cooperation - Linux Task"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use less.")
@@ -59849,7 +59919,7 @@ class KernelNamespacesCommand(GenericCommand):
     """Display namespaces of each process (shortcut for `ktask -quN`)."""
 
     _cmdline_ = "knamespaces"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-f. Qemu-system Cooperation - Linux Task"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use less.")
@@ -59875,7 +59945,7 @@ class KernelLoadCommand(GenericCommand):
     """Load the vmlinux without a load address."""
 
     _cmdline_ = "kload"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-e. Qemu-system Cooperation - Linux Symbol/Type"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("path", metavar="VMLINUX_PATH", type=str, help="path of the vmlinux.")
@@ -59904,7 +59974,7 @@ class KernelModuleCommand(GenericCommand, BufferingOutput):
     """Display kernel module list."""
 
     _cmdline_ = "kmod"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-g. Qemu-system Cooperation - Linux Advanced"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ascii diagram.")
@@ -60601,7 +60671,7 @@ class KernelModuleLoadCommand(GenericCommand):
     """Load the kernel module without a load address."""
 
     _cmdline_ = "kmod-load"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-e. Qemu-system Cooperation - Linux Symbol/Type"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("name", type=str, help="name of the loaded module to search for by `kmod`.")
@@ -60849,7 +60919,7 @@ class KernelBlockDevicesCommand(GenericCommand, BufferingOutput):
     """Display block device list."""
 
     _cmdline_ = "kbdev"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-g. Qemu-system Cooperation - Linux Advanced"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use less.")
@@ -61224,7 +61294,7 @@ class KernelCharacterDevicesCommand(GenericCommand, BufferingOutput):
     """Display character device list."""
 
     _cmdline_ = "kcdev"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-g. Qemu-system Cooperation - Linux Advanced"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ascii diagram.")
@@ -62359,7 +62429,7 @@ class KernelOperationsCommand(GenericCommand, BufferingOutput):
     """Display the members of commonly used function table (like struct file_operations) in the kernel."""
 
     _cmdline_ = "kops"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-g. Qemu-system Cooperation - Linux Advanced"
 
     types = [
         "address_space_operations",
@@ -63445,7 +63515,7 @@ class KernelSysctlCommand(GenericCommand, BufferingOutput):
     """Dump the sysctl parameters."""
 
     _cmdline_ = "ksysctl"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-g. Qemu-system Cooperation - Linux Advanced"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ascii diagram.")
@@ -63918,7 +63988,7 @@ class KernelFileSystemsCommand(GenericCommand, BufferingOutput):
     """Dump filesystems."""
 
     _cmdline_ = "kfilesystems"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-g. Qemu-system Cooperation - Linux Advanced"
     _aliases_ = ["kmounts"]
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
@@ -64410,7 +64480,7 @@ class KernelClockSourceCommand(GenericCommand, BufferingOutput):
     """Dump the clocksource list."""
 
     _cmdline_ = "kclock-source"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-g. Qemu-system Cooperation - Linux Advanced"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ascii diagram.")
@@ -64517,7 +64587,7 @@ class KernelTimerCommand(GenericCommand, BufferingOutput):
     """Dump the timer."""
 
     _cmdline_ = "ktimer"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-g. Qemu-system Cooperation - Linux Advanced"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ascii diagram.")
@@ -64955,7 +65025,7 @@ class KernelPciDeviceCommand(GenericCommand, BufferingOutput):
     """Dump the PCI devices."""
 
     _cmdline_ = "kpcidev"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-g. Qemu-system Cooperation - Linux Advanced"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use less.")
@@ -65417,7 +65487,7 @@ class KernelConfigCommand(GenericCommand, BufferingOutput):
     """Dump the kernel config if available."""
 
     _cmdline_ = "kconfig"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-g. Qemu-system Cooperation - Linux Advanced"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-f", "--filter", action="append", type=re.compile, default=[],
@@ -65491,7 +65561,7 @@ class KernelSearchCodePtrCommand(GenericCommand):
     """Search the code pointer in kernel data area."""
 
     _cmdline_ = "ksearch-code-ptr"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-k. Qemu-system Cooperation - Other"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-d", "--depth", type=int, default=1, help="depth of reference. (default: %(default)s)")
@@ -65605,7 +65675,7 @@ class KernelDmesgCommand(GenericCommand, BufferingOutput):
     """Dump the ring buffer of the dmesg area."""
 
     _cmdline_ = "kdmesg"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-g. Qemu-system Cooperation - Linux Advanced"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ascii diagram.")
@@ -66120,7 +66190,8 @@ class SyscallTableViewCommand(GenericCommand, BufferingOutput):
     """Display syscall_table entries."""
 
     _cmdline_ = "syscall-table-view"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-g. Qemu-system Cooperation - Linux Advanced"
+    _aliases_ = ["kst"]
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-f", "--filter", action="append", type=re.compile, default=[], help="REGEXP filter.")
@@ -68362,6 +68433,128 @@ class HashValueCommand(HashCommand):
 
 
 @register_command
+class JsonCommand(GenericCommand, BufferingOutput):
+    """The base command to pretty print for JSON."""
+
+    _cmdline_ = "json"
+    _category_ = "03-b. Memory - View"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    if (sys.version_info.major, sys.version_info.minor) >= (3, 7):
+        subparsers = parser.add_subparsers(title="command", required=True)
+    else:
+        subparsers = parser.add_subparsers(title="command")
+    subparsers.add_parser("memory")
+    subparsers.add_parser("value")
+    _syntax_ = parser.format_help()
+
+    def __init__(self, *args, **kwargs):
+        prefix = kwargs.get("prefix", True)
+        complete = kwargs.get("complete", gdb.COMPLETE_NONE)
+        super().__init__(prefix=prefix, complete=complete)
+        return
+
+    @parse_args
+    def do_invoke(self, args):
+        self.usage()
+        return
+
+
+@register_command
+class JsonMemoryCommand(JsonCommand):
+    """Pretty print JSON from memory values."""
+
+    _cmdline_ = "json memory"
+    _category_ = "03-b. Memory - View"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("location", metavar="LOCATION", type=AddressUtil.parse_address,
+                        help="start address for json.")
+    parser.add_argument("-n", "--no-pager", action="store_true", help="do not use less.")
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        "{0:s} $rdi",
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    def __init__(self):
+        super().__init__(prefix=False, complete=gdb.COMPLETE_LOCATION)
+        return
+
+    def read_json(self, loc):
+        pos = 0
+        s = b""
+        while True:
+            try:
+                blob = read_memory(loc + pos, 1)
+            except gdb.MemoryError:
+                err("Memory read error")
+                break
+            if blob == b"\x00":
+                break
+            s += blob
+            pos += 1
+        return s
+
+    @parse_args
+    @only_if_gdb_running
+    def do_invoke(self, args):
+        j = self.read_json(args.location)
+        if not j:
+            err("Not found JSON")
+            return
+
+        import json
+        try:
+            jstr = json.dumps(json.loads(j), indent=2)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            err("Invalid JSON")
+            return
+
+        self.out = []
+        self.out.append(jstr)
+        self.print_output(check_terminal_size=True)
+        return
+
+
+@register_command
+class JsonValueCommand(JsonCommand):
+    """Pretty print JSON from specified value."""
+
+    _cmdline_ = "json value"
+    _category_ = "03-b. Memory - View"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("value", metavar="VALUE", help="the string of JSON.")
+    parser.add_argument("-n", "--no-pager", action="store_true", help="do not use less.")
+    _syntax_ = parser.format_help()
+
+    _example_ = [
+        '{0:s} \'["foo", {{"bar": ["baz", null, 1.0, 2]}}]\'',
+    ]
+    _example_ = "\n".join(_example_).format(_cmdline_)
+
+    def __init__(self):
+        super().__init__(prefix=False)
+        return
+
+    @parse_args
+    def do_invoke(self, args):
+        import json
+        try:
+            jstr = json.dumps(json.loads(self.args.value), indent=2)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            err("Invalid JSON")
+            return
+
+        self.out = []
+        self.out.append(jstr)
+        self.print_output(check_terminal_size=True)
+        return
+
+
+@register_command
 class CrcCommand(GenericCommand, BufferingOutput):
     """The base command to calculate crc."""
 
@@ -68525,156 +68718,294 @@ class CrcValueCommand(CrcCommand):
 
 
 @register_command
-class Crc32revCommand(GenericCommand):
+class Crc32revCommand(GenericCommand, BufferingOutput):
     """Perform CRC32 reverse calculation limited to ASCII character range."""
 
     _cmdline_ = "crc32rev"
     _category_ = "09-f. Misc - Calculation"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
-    parser.add_argument("-p", "--poly", type=lambda x: int(x, 16), default=0x04c11db7,
-                        help="polynomial. (default: %(default)#x)")
-    parser.add_argument("-i", "--init-value", type=lambda x: int(x, 16), default=0x0,
-                        help="initial value. (default: %(default)#x)")
-    parser.add_argument("wanted_crc", metavar="WANTED_CRC", type=lambda x: int(x, 16),
-                        help="crc target value.")
-    parser.add_argument("--prefix", default="", help="prefix string. (default: '')")
-    parser.add_argument("--suffix", default="", help="suffix string. (default: '')")
+    parser.add_argument("-p", "--poly", type=lambda x: int(x, 16), help="generator polynomial in MSB form.")
+    parser.add_argument("--poly-reflected", action="store_true",
+                        help="treat --poly as already reflected (LSB form, e.g., 0xedb88320).")
+    parser.add_argument("-i", "--init-value", type=lambda x: int(x, 16), help="initial CRC register value.")
+    parser.add_argument("-o", "--xorout", type=lambda x: int(x, 16), help="final XOR value applied after output reflection.")
+    parser.add_argument("--refin", action="store_true", help="enable input reflection (LSB-first).")
+    parser.add_argument("--no-refin", action="store_true", help="disable input reflection (MSB-first).")
+    parser.add_argument("--refout", action="store_true", help="enable output reflection.")
+    parser.add_argument("--no-refout", action="store_true", help="disable output reflection.")
+    parser.add_argument("--preset", choices=[
+        "", "base", "ieee", "isohdlc", "adccp", "v42", "xz", "pkzip",
+        "aixm", "q",
+        "autosar",
+        "base91d", "d",
+        "bzip2", "aal5", "dectb", "b",
+        "cdromedc",
+        "cksum", "posix",
+        "iscsi", "base91c", "castagnoli", "interlaken", "c", "nvme",
+        "jamcrc",
+        "mef",
+        "mpeg2", "ether",
+        "xfer",
+    ], default="", help="quick parameter presets, explicit flags override preset values.")
+    parser.add_argument("--list", action="store_true", help="print CRC presets.")
+    parser.add_argument("wanted_crc", metavar="WANTED_CRC", nargs="?", type=lambda x: int(x, 16),
+                        help="target CRC value (hex).")
+    parser.add_argument("--prefix", default="", help="prefix string (ASCII).")
+    parser.add_argument("--suffix", default="", help="suffix string (ASCII).")
+    parser.add_argument("-n", "--no-pager", action="store_true", help="do not use less.")
     _syntax_ = parser.format_help()
 
     _example_ = [
+        "{0:s} --list",
+        "{0:s} 0x41414141",
         "{0:s} 0x41414141 --prefix AAAA --suffix BBBB",
+        "{0:s} 0x41414141 --preset mpeg2",
     ]
     _example_ = "\n".join(_example_).format(_cmdline_)
 
-    _note_ = [
-        "The commonly polynomials (and work correctly) are as follows (after / is the reflected one):",
-        "- 0x04c11db7 / 0xedb88320 : CRC-32-IEEE 802.3",
-        "- 0x1edc6f41 / 0x82f63b78 : CRC-32C Castagnoli",
-        "- 0x741b8cd7 / 0xeb31d82e : CRC-32K Koopman",
-        "- 0x814141ab / 0xd5828281 : CRC-32Q",
-        "- 0xf4acfb13 / 0xc8df352f : CRC-Autosar",
-        "- 0xa833982b / 0xd419cc15 : CRC-32D",
-    ]
-    _note_ = "\n".join(_note_)
+    preset_dic = {
+        # https://reveng.sourceforge.io/crc-catalogue/all.htm
+        # preset name: (poly,        init_value,  xorout,      refin, refout, alias)
+        "":            (0x04c1_1db7, 0xffff_ffff, 0xffff_ffff, True,  True,   False),
+        "base":        (0x04c1_1db7, 0xffff_ffff, 0xffff_ffff, True,  True,   True),
+        "ieee":        (0x04c1_1db7, 0xffff_ffff, 0xffff_ffff, True,  True,   True),
+        "isohdlc":     (0x04c1_1db7, 0xffff_ffff, 0xffff_ffff, True,  True,   True),
+        "adccp":       (0x04c1_1db7, 0xffff_ffff, 0xffff_ffff, True,  True,   True),
+        "v42":         (0x04c1_1db7, 0xffff_ffff, 0xffff_ffff, True,  True,   True),
+        "xz":          (0x04c1_1db7, 0xffff_ffff, 0xffff_ffff, True,  True,   True),
+        "pkzip":       (0x04c1_1db7, 0xffff_ffff, 0xffff_ffff, True,  True,   True),
+        "aixm":        (0x8141_41ab, 0x0000_0000, 0x0000_0000, False, False,  False),
+        "q":           (0x8141_41ab, 0x0000_0000, 0x0000_0000, False, False,  True),
+        "autosar":     (0xf4ac_fb13, 0xffff_ffff, 0xffff_ffff, True,  True,   False),
+        "base91d":     (0xa833_982b, 0xffff_ffff, 0xffff_ffff, True,  True,   False),
+        "d":           (0xa833_982b, 0xffff_ffff, 0xffff_ffff, True,  True,   True),
+        "bzip2":       (0x04c1_1db7, 0xffff_ffff, 0xffff_ffff, False, False,  False),
+        "aal5":        (0x04c1_1db7, 0xffff_ffff, 0xffff_ffff, False, False,  True),
+        "dectb":       (0x04c1_1db7, 0xffff_ffff, 0xffff_ffff, False, False,  True),
+        "b":           (0x04c1_1db7, 0xffff_ffff, 0xffff_ffff, False, False,  True),
+        "cdromedc":    (0x8001_801b, 0x0000_0000, 0x0000_0000, True,  True,   False),
+        "cksum":       (0x04c1_1db7, 0x0000_0000, 0xffff_ffff, False, False,  False),
+        "posix":       (0x04c1_1db7, 0x0000_0000, 0xffff_ffff, False, False,  True),
+        "iscsi":       (0x1edc_6f41, 0xffff_ffff, 0xffff_ffff, True,  True,   False),
+        "base91c":     (0x1edc_6f41, 0xffff_ffff, 0xffff_ffff, True,  True,   True),
+        "castagnoli":  (0x1edc_6f41, 0xffff_ffff, 0xffff_ffff, True,  True,   True),
+        "interlaken":  (0x1edc_6f41, 0xffff_ffff, 0xffff_ffff, True,  True,   True),
+        "c":           (0x1edc_6f41, 0xffff_ffff, 0xffff_ffff, True,  True,   True),
+        "nvme":        (0x1edc_6f41, 0xffff_ffff, 0xffff_ffff, True,  True,   True),
+        "jamcrc":      (0x04c1_1db7, 0xffff_ffff, 0x0000_0000, True,  True,   False),
+        "mef":         (0x741b_8cd7, 0xffff_ffff, 0x0000_0000, True,  True,   False),
+        "mpeg2":       (0x04c1_1db7, 0xffff_ffff, 0x0000_0000, False, False,  False),
+        "ether":       (0x04c1_1db7, 0xffff_ffff, 0x0000_0000, False, False,  True),
+        "xfer":        (0x0000_00af, 0x0000_0000, 0x0000_0000, False, False,  False),
+    }
 
-    def init_poly(self):
-        self.reflected_poly = 0
-        for i in range(32):
-            self.reflected_poly |= ((self.args.poly >> i) & 1) << (31 - i)
+    def print_preset_dict(self):
+        fmt = "{:<10s}  {:<10s}  {:<10s}  {:<10s}  {:<10s}  {:5s}  {:6s}  {:5s}"
+        legend = ["name", "poly", "rpoly", "init_value", "xorout", "refin", "refout", "alias"]
+        self.out.append(GefUtil.make_legend(fmt.format(*legend)))
+
+        for k, v in self.preset_dic.items():
+            if v[5]:
+                alias = "(alias)"
+            else:
+                alias = ""
+            self.out.append("{:10s}  {:#010x}  {:#010x}  {:#010x}  {:#010x}  {!s:5s}  {!s:6s}  {:s}".format(
+                k or "''", v[0], self.reflect32(v[0]), v[1], v[2], v[3], v[4], alias),
+            )
         return
 
-    def build_crc_tables(self):
-        self.normal_table = []
-        self.reverse_table = []
-        for i in range(256):
-            fwd = i
-            rev = i << 24
-            for _ in range(8):
-                # build normal table
-                if (fwd & 1) == 1:
-                    fwd = (fwd >> 1) ^ self.reflected_poly
-                else:
-                    fwd >>= 1
-                fwd &= 0xffff_ffff
+    def reflect32(self, x):
+        """bit reverse."""
+        return int("{:032b}".format(x)[::-1], 2) & 0xffff_ffff
 
-                # build reverse table
-                if (rev & 0x8000_0000) == 0x8000_0000:
-                    rev = ((rev ^ self.reflected_poly) << 1) | 1
-                else:
-                    rev <<= 1
-                rev &= 0xffff_ffff
-
-            self.normal_table.append(fwd)
-            self.reverse_table.append(rev)
+    def build_crc(self):
+        """Apply preset parameters if requested. Explicit CLI flags override these."""
+        poly, init_value, xorout, refin, refout, _ = self.preset_dic[self.args.preset]
+        # override from CLI
+        if self.args.poly is not None:
+            poly = self.args.poly & 0xffff_ffff
+        if self.args.poly_reflected:
+            poly = self.reflect32(poly)
+        rpoly = self.reflect32(poly)
+        if self.args.init_value is not None:
+            init_value = self.args.init_value & 0xffff_ffff
+        if self.args.xorout is not None:
+            xorout = self.args.xorout & 0xffff_ffff
+        if self.args.refin:
+            refin = True
+        if self.args.no_refin:
+            refin = False
+        if self.args.refout:
+            refout = True
+        if self.args.no_refout:
+            refout = False
+        assert refin == refout
+        # build
+        CRC = collections.namedtuple("CRC", ["poly", "rpoly", "init_value", "xorout", "refin", "refout"])
+        self.CRC = CRC(poly, rpoly, init_value, xorout, refin, refout)
         return
 
-    def v2b(self, x):
-        b = [
-            (x >> 0) & 0xff,
-            (x >> 8) & 0xff,
-            (x >> 16) & 0xff,
-            (x >> 24) & 0xff,
-        ]
-        return b
+    def build_tables(self):
+        """Build forward / reverse table and the inverse index used by backward steps."""
+        self.FT = [] # used always
+        self.RT = [] # used when refin == refout == True
+        self.inv_idx = [0] * 256 # used when refin == refout == False
 
-    def calc_crc32(self, msg):
-        crc = self.args.init_value ^ 0xffff_ffff
-        for c in msg:
-            if isinstance(c, str):
-                c = ord(c)
-            crc = (crc >> 8) ^ self.normal_table[(crc ^ c) & 0xff]
-        return crc ^ 0xffff_ffff
+        if not self.CRC.refin and not self.CRC.refout:
+            for i in range(256):
+                fwd = i << 24
+                for _ in range(8):
+                    if fwd & 0x8000_0000:
+                        fwd = ((fwd << 1) ^ self.CRC.poly) & 0xffff_ffff
+                    else:
+                        fwd = (fwd << 1) & 0xffff_ffff
+                self.FT.append(fwd)
+            for i in range(256):
+                self.inv_idx[self.FT[i] & 0xff] = i
+        else:
+            for i in range(256):
+                fwd = i
+                rev = i << 24
+                for _ in range(8):
+                    if fwd & 1:
+                        fwd = ((fwd >> 1) ^ self.CRC.rpoly) & 0xffff_ffff
+                    else:
+                        fwd = (fwd >> 1) & 0xffff_ffff
+                    if (rev >> 31) & 1:
+                        rev = (((rev ^ self.CRC.rpoly) << 1) | 1) & 0xffff_ffff
+                    else:
+                        rev = (rev << 1) & 0xffff_ffff
+                self.FT.append(fwd)
+                self.RT.append(rev)
+        return
 
-    def calc_forward(self, accum, string):
-        fwd_crc = accum
-        for c in string:
-            fwd_crc = (fwd_crc >> 8) ^ self.normal_table[(fwd_crc ^ c) & 0xff]
-        return fwd_crc
+    def calc_forward(self, accum, data_bytes):
+        crc = accum
+        if not self.CRC.refin and not self.CRC.refout:
+            for c in data_bytes:
+                idx = ((crc >> 24) ^ c) & 0xff
+                crc = ((crc << 8) & 0xffff_ffff) ^ self.FT[idx]
+        else:
+            for c in data_bytes:
+                idx = (crc ^ c) & 0xff
+                crc = (crc >> 8) ^ self.FT[idx]
+        return crc
 
-    def calc_backward(self, wanted, string):
-        bkd_crc = wanted
-        for c in string[::-1]:
-            bkd_crc = ((bkd_crc << 8) & 0xffff_ffff) ^ self.reverse_table[bkd_crc >> 24] ^ c
-        return bkd_crc
+    def calc_backward(self, wanted, data_bytes):
+        crc = wanted
+        if not self.CRC.refin and not self.CRC.refout:
+            for c in data_bytes[::-1]:
+                b = self.inv_idx[crc & 0xff]
+                prev_top = b ^ c
+                q = crc ^ self.FT[b]
+                crc = ((q >> 8) & 0xffff_ffff) | ((prev_top & 0xff) << 24)
+        else:
+            for c in data_bytes[::-1]:
+                idx = crc >> 24
+                crc = ((crc << 8) & 0xffff_ffff) ^ self.RT[idx] ^ c
+        return crc
+
+    def calc_crc32(self, msg_bytes):
+        crc = self.CRC.init_value
+        crc = self.calc_forward(crc, msg_bytes)
+        return crc ^ self.CRC.xorout
 
     def find_bridge(self, init_value, wanted_crc, prefix, suffix):
-        # forward calculation of CRC, sets current forward CRC state
+        """Compute a 4-byte bridge so that CRC(prefix + bridge + suffix) == wanted_crc."""
+        # forward state after prefix (raw)
         fwd_crc = self.calc_forward(init_value, prefix)
 
-        # backward calculation of CRC, sets wanted backward CRC state
-        bkd_crc = self.calc_backward(wanted_crc ^ 0xffff_ffff, suffix)
+        # map external wanted -> raw wanted (invert output formatting)
+        wanted_raw = wanted_crc ^ self.CRC.xorout
 
-        # deduce the 4 bytes we need to insert
-        bridge = self.calc_backward(bkd_crc, self.v2b(fwd_crc))
-        bridge = self.v2b(bridge)
+        # rewind suffix to get the raw state right before suffix
+        bkd_crc = self.calc_backward(wanted_raw, suffix)
 
-        # check
-        res = prefix + bridge + suffix
-        assert self.calc_crc32(res) == wanted_crc
-        return bridge
+        def state_bytes(x):
+            if not self.CRC.refin and not self.CRC.refout:
+                xs = [(x >> 24) & 0xff, (x >> 16) & 0xff, (x >> 8) & 0xff, (x >> 0) & 0xff]
+                return xs
+            else:
+                xs = [(x >> 0) & 0xff, (x >> 8) & 0xff, (x >> 16) & 0xff, (x >> 24) & 0xff]
+                return xs
+
+        # 4-byte exact bridge between fwd_crc and bkd_crc
+        bridge_word = self.calc_backward(bkd_crc, state_bytes(fwd_crc))
+        bridge_bytes = state_bytes(bridge_word)
+
+        # sanity check
+        test_seq = prefix + bridge_bytes + suffix
+        assert self.calc_crc32(test_seq) == wanted_crc
+        return bridge_bytes
 
     def find_reverse(self, prefix, suffix):
-        self.init_poly()
-        self.build_crc_tables()
+        """Search ASCII-only bridges of length 4..6(+7)."""
+        self.build_crc()
+        self.build_tables()
 
-        init_value = self.args.init_value ^ 0xffff_ffff
-        wanted_crc = self.args.wanted_crc
+        init_value = self.CRC.init_value
+        wanted_crc = self.args.wanted_crc & 0xffff_ffff
 
         ascii_range = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_"
         solutions = []
 
-        # check 4 bytes
+        # 4 bytes
         bridge = self.find_bridge(init_value, wanted_crc, prefix, suffix)
         if all(c in ascii_range for c in bridge):
             solutions.append(bridge)
-
-        # check 5 bytes
+        # 5 bytes
         for b in ascii_range:
             new_prefix = prefix + [b]
             bridge = self.find_bridge(init_value, wanted_crc, new_prefix, suffix)
             if all(c in ascii_range for c in bridge):
                 solutions.append([b] + bridge)
-
-        # check 6 bytes
+        # 6 bytes
         for b1 in ascii_range:
             for b2 in ascii_range:
                 new_prefix = prefix + [b1, b2]
                 bridge = self.find_bridge(init_value, wanted_crc, new_prefix, suffix)
                 if all(c in ascii_range for c in bridge):
                     solutions.append([b1, b2] + bridge)
+
+        if solutions:
+            return solutions
+
+        # 7 bytes
+        for b1 in ascii_range:
+            for b2 in ascii_range:
+                for b3 in ascii_range:
+                    new_prefix = prefix + [b1, b2, b3]
+                    bridge = self.find_bridge(init_value, wanted_crc, new_prefix, suffix)
+                    if all(c in ascii_range for c in bridge):
+                        solutions.append([b1, b2, b3] + bridge)
         return solutions
 
     @parse_args
     def do_invoke(self, args):
+        if self.args.list == (self.args.wanted_crc is not None):
+            self.usage()
+            return
+
+        self.out = []
+
+        if self.args.list:
+            self.print_preset_dict()
+            self.print_output(check_terminal_size=True)
+            return
+
         prefix = [ord(c) for c in self.args.prefix]
         suffix = [ord(c) for c in self.args.suffix]
 
-        solutions = self.find_reverse(prefix, suffix)
-        for sol in solutions:
-            msg = prefix + sol + suffix
-            crc = self.calc_crc32(msg)
-            gef_print("{}: CRC32({}) = {:#x}".format(bytes(sol), bytes(msg), crc))
+        sols = self.find_reverse(prefix, suffix)
+        if sols:
+            for sol in sols:
+                msg = prefix + sol + suffix
+                crc = self.calc_crc32(msg)
+                self.out.append("{}: CRC32({}) = {:#010x}".format(bytes(sol), bytes(msg), crc))
+        else:
+            self.err_add_out("No ASCII-only bridge found under given constraints.")
+        self.print_output(check_terminal_size=True)
         return
 
 
@@ -70000,7 +70331,7 @@ class SlubDumpCommand(GenericCommand, BufferingOutput):
     """Dump slub free-list."""
 
     _cmdline_ = "slub-dump"
-    _category_ = "08-e. Qemu-system Cooperation - Linux Allocator"
+    _category_ = "08-h. Qemu-system Cooperation - Linux Allocator"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ascii diagram.")
@@ -70138,7 +70469,7 @@ class SlubDumpCommand(GenericCommand, BufferingOutput):
 
     _note2_ = [
         "* A mitigation called CONFIG_SLAB_VIRTUAL was proposed in September 2023 to prevent cross-cache attack.",
-        "  This config is not merged into mainline as of May 2025, but used in KernelCTF@Google Securty Research.",
+        "  This config is not merged into mainline as of May 2025, but used in KernelCTF@Google Security Research.",
         "* A unique feature of CONFIG_SLAB_VIRTUAL is that in addition to the existing SLUB structure,",
         "  it also has a structure for managing released slab structures.",
         "",
@@ -70818,7 +71149,7 @@ class SlubDumpCommand(GenericCommand, BufferingOutput):
 
     struct kmem_cache {                          // if CONFIG_SLAB_VIRTUAL=y
         ...
-        struct kmem_cache_order_objects min;     // [ANOTATION]
+        struct kmem_cache_order_objects min;     // [ANNOTATION]
         struct kmem_cache_order_objects oo;      //    In kernel < 6.1.55, `min` and `oo` are swapped.
         struct kmem_cache_virtual {              // if CONFIG_SLAB_VIRTUAL=y && kernel >= 6.1.55
             spinlock_t freed_slabs_lock;
@@ -71744,7 +72075,7 @@ class SlubDumpCommand(GenericCommand, BufferingOutput):
                     )
                     self.out.append("    kmem_cache_node[{:d}]: {:#x}".format(node_index, node_addr))
 
-                    # node list (patial)
+                    # node list (partial)
                     printed_count = 0
                     for node_page in node_page_list_partial:
                         self.dump_page(node_page, kmem_cache, "node")
@@ -71881,7 +72212,7 @@ class SlubTinyDumpCommand(GenericCommand, BufferingOutput):
     """Dump slub-tiny free-list."""
 
     _cmdline_ = "slub-tiny-dump"
-    _category_ = "08-e. Qemu-system Cooperation - Linux Allocator"
+    _category_ = "08-h. Qemu-system Cooperation - Linux Allocator"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ascii diagram.")
@@ -72571,7 +72902,7 @@ class SlabDumpCommand(GenericCommand, BufferingOutput):
     """Dump slab free-list."""
 
     _cmdline_ = "slab-dump"
-    _category_ = "08-e. Qemu-system Cooperation - Linux Allocator"
+    _category_ = "08-h. Qemu-system Cooperation - Linux Allocator"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ascii diagram.")
@@ -73389,7 +73720,7 @@ class SlobDumpCommand(GenericCommand, BufferingOutput):
     """Dump slob free-list."""
 
     _cmdline_ = "slob-dump"
-    _category_ = "08-e. Qemu-system Cooperation - Linux Allocator"
+    _category_ = "08-h. Qemu-system Cooperation - Linux Allocator"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ascii diagram.")
@@ -73776,7 +74107,7 @@ class SlabContainsCommand(GenericCommand):
     """Resolve the slab cache (kmem_cache) that an object belongs to (for slab/slub/slub-tiny)."""
 
     _cmdline_ = "slab-contains"
-    _category_ = "08-e. Qemu-system Cooperation - Linux Allocator"
+    _category_ = "08-h. Qemu-system Cooperation - Linux Allocator"
     _aliases_ = ["xslab"]
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
@@ -73967,7 +74298,7 @@ class BuddyDumpCommand(GenericCommand, BufferingOutput):
     """Dump the zone of the page allocator (buddy allocator) free-list."""
 
     _cmdline_ = "buddy-dump"
-    _category_ = "08-e. Qemu-system Cooperation - Linux Allocator"
+    _category_ = "08-h. Qemu-system Cooperation - Linux Allocator"
     _aliases_ = ["zone-dump", "pcplist"]
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
@@ -74751,7 +75082,7 @@ class KernelPipeCommand(GenericCommand, BufferingOutput):
     """Dump pipe information."""
 
     _cmdline_ = "kpipe"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-g. Qemu-system Cooperation - Linux Advanced"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ascii diagram.")
@@ -75169,7 +75500,7 @@ class KernelBpfCommand(GenericCommand, BufferingOutput):
     """Dump the BPF information."""
 
     _cmdline_ = "kbpf"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-g. Qemu-system Cooperation - Linux Advanced"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ascii diagram.")
@@ -75645,7 +75976,7 @@ class KernelIpcsCommand(GenericCommand, BufferingOutput):
     """Dump IPCs information (System V semaphore, message queue and shared memory)."""
 
     _cmdline_ = "kipcs"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-g. Qemu-system Cooperation - Linux Advanced"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ascii diagram.")
@@ -76133,7 +76464,7 @@ class KernelDeviceIOCommand(GenericCommand, BufferingOutput):
     """Dump I/O-port and I/O-memory information."""
 
     _cmdline_ = "kdevio"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-g. Qemu-system Cooperation - Linux Advanced"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ascii diagram.")
@@ -76300,7 +76631,7 @@ class KernelDmaBufCommand(GenericCommand, BufferingOutput):
     """Dump DMA-BUF information."""
 
     _cmdline_ = "kdmabuf"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-g. Qemu-system Cooperation - Linux Advanced"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ascii diagram.")
@@ -76619,7 +76950,7 @@ class KernelIrqCommand(GenericCommand, BufferingOutput):
     """Dump IRQ (interrupt request) information."""
 
     _cmdline_ = "kirq"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-g. Qemu-system Cooperation - Linux Advanced"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ascii diagram.")
@@ -77032,7 +77363,7 @@ class KernelNetDeviceCommand(GenericCommand, BufferingOutput):
     """Dump net device information."""
 
     _cmdline_ = "knetdev"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-g. Qemu-system Cooperation - Linux Advanced"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ascii diagram.")
@@ -77170,7 +77501,7 @@ class VmallocDumpCommand(GenericCommand, BufferingOutput):
     """Dump vmalloc used list and freed list."""
 
     _cmdline_ = "vmalloc-dump"
-    _category_ = "08-e. Qemu-system Cooperation - Linux Allocator"
+    _category_ = "08-h. Qemu-system Cooperation - Linux Allocator"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ascii diagram.")
@@ -77248,6 +77579,7 @@ class VmallocDumpCommand(GenericCommand, BufferingOutput):
             unsigned int nr_pages;
             phys_addr_t phys_addr;
             const void *caller;
+            unsigned long requested_size; // v6.12~
         };
         """
 
@@ -77369,13 +77701,13 @@ class VmallocDumpCommand(GenericCommand, BufferingOutput):
             if used:
                 virt_str = Color.colorify(virt_str, used_address_color)
                 state = "in-use"
-                flags_str = " " + self.get_flags(flags)
+                flags_str = self.get_flags(flags)
                 flags_str = flags_str.rstrip()
             else:
                 virt_str = Color.colorify(virt_str, freed_address_color)
                 state = "freed"
-                flags_str = ""
-            self.out.append("{:<4d} {:6s} {:s} {:s}{:s}".format(idx, state, virt_str, size_str, flags_str))
+                flags_str = "-"
+            self.out.append("{:<4d} {:6s} {:s} {:s} {:s}".format(idx, state, virt_str, size_str, flags_str))
         return
 
     @parse_args
@@ -77413,12 +77745,164 @@ class VmallocDumpCommand(GenericCommand, BufferingOutput):
 
 
 @register_command
+class KtypesCommand(GenericCommand, BufferingOutput):
+    """Display kernel type information from /sys/kernel/btf/vmlinux."""
+
+    _cmdline_ = "ktypes"
+    _category_ = "08-e. Qemu-system Cooperation - Linux Symbol/Type"
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("-r", "--rescan", action="store_true", help="do not use cache.")
+    parser.add_argument("-n", "--no-pager", action="store_true", help="do not use less.")
+    _syntax_ = parser.format_help()
+
+    _note_ = [
+        "This command needs CONFIG_DEBUG_INFO_BTF=y.",
+        "CONFIG_KALLSYMS_ALL=y is not required.",
+    ]
+    _note_ = "\n".join(_note_)
+
+    def check_command(self):
+        try:
+            GefUtil.which("bpftool")
+            GefUtil.which("gcc")
+        except FileNotFoundError as e:
+            err("{}".format(e))
+            return False
+        return True
+
+    def get_base_name(self):
+        if not hasattr(__gef_command_instances__["ksymaddr-remote"], "kernel_version"):
+            gdb.execute("ksymaddr-remote --no-pager GEF_DUMMY_STRING", to_string=True)
+            if not hasattr(__gef_command_instances__["ksymaddr-remote"], "kernel_version"):
+                err("Not found kernel version")
+                return None
+
+        ks = __gef_command_instances__["ksymaddr-remote"]
+        h = hashlib.sha256(String.str2bytes(ks.version_string)).hexdigest()[-16:]
+        major, minor, patch = ks.kernel_version
+        base_name = os.path.join(GEF_TEMP_DIR, "ktypes-{:d}.{:d}.{:d}-{:s}".format(major, minor, patch, h))
+        return base_name
+
+    def get_btf_addr(self):
+        start = Symbol.get_ksymaddr("__start_BTF")
+        if start is None:
+            return None
+        end = Symbol.get_ksymaddr("__stop_BTF")
+        return start, end - start
+
+    def build_header_file(self):
+        base_path = self.get_base_name()
+        if base_path is None:
+            return None
+
+        raw_path = base_path + ".raw"
+        header_path = base_path + ".h"
+
+        # use cache
+        if not self.args.rescan:
+            if os.path.exists(header_path) and os.path.getsize(header_path) > 0:
+                return header_path
+
+        # get address of /sys/kernel/btf/vmlinux
+        addr_size = self.get_btf_addr()
+        if addr_size is None:
+            err("Not found /sys/kernel/btf/vmlinux")
+            return None
+
+        # read /sys/kernel/btf/vmlinux
+        try:
+            content = read_memory(*addr_size)
+        except gdb.MemoryError:
+            err("Memory read error")
+            return None
+
+        # save it
+        open(raw_path, "wb").write(content)
+
+        # raw -> vmlinux.h
+        os.system("{!r} btf dump file {!r} format c > {!r}".format(GefUtil.which("bpftool"), raw_path, header_path))
+        return header_path
+
+    @parse_args
+    @only_if_gdb_running
+    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware"))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64", "RISCV32", "RISCV64"))
+    def do_invoke(self, args):
+        if not self.check_command():
+            return
+
+        header_path = self.build_header_file()
+        if header_path is None:
+            warn("This kernel may be CONFIG_DEBUG_INFO_BTF=n")
+            return
+
+        content = open(header_path, "r").read()
+
+        self.out = []
+        self.out.extend(content.splitlines())
+        self.print_output(check_terminal_size=True)
+        return
+
+
+@register_command
+class KtypesLoadCommand(KtypesCommand):
+    """Load kernel type information from /sys/kernel/btf/vmlinux."""
+
+    _cmdline_ = "ktypes-load"
+    _category_ = "08-e. Qemu-system Cooperation - Linux Symbol/Type"
+    _aliases_ = ["kt-load"]
+
+    parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("-r", "--rescan", action="store_true", help="do not use cache.")
+    _syntax_ = parser.format_help()
+
+    def build_obj_file(self, header_path):
+        source_path = header_path[:-2] + ".c"
+        obj_path = source_path[:-2]
+
+        # use cache
+        if not self.args.rescan:
+            if os.path.exists(obj_path) and os.path.getsize(obj_path) > 0:
+                return obj_path
+
+        # copy vmlinux.h to vmlinux.c
+        open(source_path, "wb").write(open(header_path, "rb").read())
+
+        # build with debug types
+        os.system("{!r} -g -O0 -g -fno-eliminate-unused-debug-types -c {!r} -o {!r}".format(
+            GefUtil.which("gcc"), source_path, obj_path,
+        ))
+        return obj_path
+
+    @parse_args
+    @only_if_gdb_running
+    @only_if_specific_gdb_mode(mode=("qemu-system", "vmware"))
+    @only_if_specific_arch(arch=("x86_32", "x86_64", "ARM32", "ARM64", "RISCV32", "RISCV64"))
+    def do_invoke(self, args):
+        if not self.check_command():
+            return
+
+        header_path = self.build_header_file()
+        if header_path is None:
+            return
+
+        obj_path = self.build_obj_file(header_path)
+        if obj_path is None:
+            return
+
+        gdb.execute("file {:s}".format(obj_path), to_string=True)
+        info("Kernel types are loaded successfully")
+        return
+
+
+@register_command
 class KsymaddrRemoteCommand(GenericCommand, BufferingOutput):
     """Resolve kernel symbols from kallsyms table."""
     # Thanks to https://github.com/marin-m/vmlinux-to-elf
 
     _cmdline_ = "ksymaddr-remote"
-    _category_ = "08-c. Qemu-system Cooperation - Linux Symbol"
+    _category_ = "08-e. Qemu-system Cooperation - Linux Symbol/Type"
     _aliases_ = ["ks"]
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
@@ -78721,7 +79205,7 @@ class VmlinuxToElfApplyCommand(GenericCommand):
     """Apply symbol from kallsyms in memory using vmlinux-to-elf."""
 
     _cmdline_ = "vmlinux-to-elf-apply"
-    _category_ = "08-c. Qemu-system Cooperation - Linux Symbol"
+    _category_ = "08-e. Qemu-system Cooperation - Linux Symbol/Type"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-r", "--rescan", action="store_true",
@@ -79095,7 +79579,6 @@ class TcmallocDumpCommand(GenericCommand, BufferingOutput):
               0x7ffff7e06860|+0x0060|+012: 0x0000000000000000 // nonempty_.union
               0x7ffff7e06868|+0x0068|+013: 0x0000000000000000 // nonempty_.union
               0x7ffff7e06870|+0x0070|+014: 0x0000000000000000
-
         """
         offset_next1 = 0x20
         offset_prev1 = 0x28
@@ -84877,7 +85360,7 @@ class XphysAddrCommand(GenericCommand):
     """Dump physical memory taking into account ROM mapping."""
 
     _cmdline_ = "xp"
-    _category_ = "08-a. Qemu-system Cooperation - General"
+    _category_ = "08-d. Qemu-system Cooperation - Virt/Phys/Page"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("format", metavar="/FMT", help="specified output format.")
@@ -85004,7 +85487,7 @@ class XSecureMemAddrCommand(GenericCommand):
     """Dump secure memory via qemu-system memory map."""
 
     _cmdline_ = "xsm"
-    _category_ = "08-g. Qemu-system Cooperation - TrustZone"
+    _category_ = "08-j. Qemu-system Cooperation - TrustZone"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     group = parser.add_mutually_exclusive_group(required=True)
@@ -85210,7 +85693,7 @@ class WSecureMemAddrCommand(GenericCommand):
     """Write secure memory via qemu-system memory map."""
 
     _cmdline_ = "wsm"
-    _category_ = "08-g. Qemu-system Cooperation - TrustZone"
+    _category_ = "08-j. Qemu-system Cooperation - TrustZone"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     modes = ["byte", "short", "dword", "qword", "string", "hex"]
@@ -85364,7 +85847,7 @@ class BreakSecureMemAddrCommand(GenericCommand):
     """Set a breakpoint in virtual memory by specifying the physical memory of the secure world."""
 
     _cmdline_ = "bsm"
-    _category_ = "08-g. Qemu-system Cooperation - TrustZone"
+    _category_ = "08-j. Qemu-system Cooperation - TrustZone"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("location", metavar="PHYS_ADDRESS", type=AddressUtil.parse_address,
@@ -85378,7 +85861,7 @@ class BreakSecureMemAddrCommand(GenericCommand):
     _example_ = "\n".join(_example_).format(_cmdline_)
 
     def aarch64_get_page_maps_el3(self):
-        res = PageMap.get_page_maps_by_pagewalk("pagewalk 3 --quiet --no-pager --no-merge")
+        res = PageMap.get_page_maps_by_pagewalk("pagewalk 3 --quiet --no-pager --no-merge --disable-color")
         res = sorted(set(res.splitlines()))
         res = list(filter(lambda line: line.endswith("]"), res))
         res = list(filter(lambda line: "[+]" not in line, res))
@@ -85465,13 +85948,13 @@ class OpteeThreadEnterUserModeBreakpoint(gdb.Breakpoint):
     def get_ta_loaded_address(verbose=False):
         Cache.reset_gef_caches()
         if is_arm32():
-            res = PageMap.get_page_maps_by_pagewalk("pagewalk -S --quiet --no-pager")
+            res = PageMap.get_page_maps_by_pagewalk("pagewalk -S --quiet --no-pager --disable-color")
             if verbose:
                 gef_print(res)
             res = sorted(set(res.splitlines()))
             res = list(filter(lambda line: "PL0/R-X" in line, res))
         elif is_arm64():
-            res = PageMap.get_page_maps_by_pagewalk("pagewalk 1 --quiet --no-pager")
+            res = PageMap.get_page_maps_by_pagewalk("pagewalk 1 --quiet --no-pager --disable-color")
             if verbose:
                 gef_print(res)
             res = sorted(set(res.splitlines()))
@@ -85511,7 +85994,7 @@ class OpteeBreakTaAddrCommand(GenericCommand):
     """Set a breakpoint to OPTEE-TA."""
 
     _cmdline_ = "optee-break-ta"
-    _category_ = "08-g. Qemu-system Cooperation - TrustZone"
+    _category_ = "08-j. Qemu-system Cooperation - TrustZone"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     group = parser.add_mutually_exclusive_group(required=True)
@@ -85547,7 +86030,7 @@ class OpteeBreakTaAddrCommand(GenericCommand):
         return
 
     def get_secure_memory_maps(self):
-        maps = PageMap.get_page_maps_by_pagewalk("pagewalk --optee --quiet --no-pager").splitlines()
+        maps = PageMap.get_page_maps_by_pagewalk("pagewalk --optee --quiet --no-pager --disable-color").splitlines()
         if not maps:
             err("Not found memory maps")
             return None
@@ -85689,7 +86172,7 @@ class OpteeSmcServiceDumpCommand(GenericCommand, BufferingOutput):
     """Dump the OPTEE SMC (EL3) service (specifically, the arm-trusted-firmware implementation)."""
 
     _cmdline_ = "optee-smc-service-dump"
-    _category_ = "08-g. Qemu-system Cooperation - TrustZone"
+    _category_ = "08-j. Qemu-system Cooperation - TrustZone"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use less.")
@@ -85843,7 +86326,7 @@ class OpteeTaDumpCommand(GenericCommand, BufferingOutput):
     """The base command to dump OPTEE Trusted Application."""
 
     _cmdline_ = "optee-ta-dump"
-    _category_ = "08-g. Qemu-system Cooperation - TrustZone"
+    _category_ = "08-j. Qemu-system Cooperation - TrustZone"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     if (sys.version_info.major, sys.version_info.minor) >= (3, 7):
@@ -85953,7 +86436,7 @@ class OpteeTaDumpMemoryCommand(OpteeTaDumpCommand):
     """Dump the OPTEE-Trusted-App list from OPTEE kernel memory."""
 
     _cmdline_ = "optee-ta-dump memory"
-    _category_ = "08-g. Qemu-system Cooperation - TrustZone"
+    _category_ = "08-j. Qemu-system Cooperation - TrustZone"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-o", "--for-old-version", action="store_true", help="for OP-TEE OS before v3.12.0.")
@@ -86240,7 +86723,7 @@ class OpteeTaDumpMemoryCommand(OpteeTaDumpCommand):
     @only_if_specific_gdb_mode(mode=("qemu-system",))
     @only_if_specific_arch(arch=("ARM32", "ARM64"))
     def do_invoke(self, args):
-        maps = PageMap.get_page_maps_by_pagewalk("pagewalk --optee --quiet --no-pager").splitlines()
+        maps = PageMap.get_page_maps_by_pagewalk("pagewalk --optee --quiet --no-pager --disable-color").splitlines()
         if not maps:
             err("Not found memory maps")
             return
@@ -86279,7 +86762,7 @@ class OpteeTaDumpDirectoryCommand(OpteeTaDumpCommand):
     """Dump the OPTEE-Trusted-App list from host directory."""
 
     _cmdline_ = "optee-ta-dump dir"
-    _category_ = "08-g. Qemu-system Cooperation - TrustZone"
+    _category_ = "08-j. Qemu-system Cooperation - TrustZone"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("host_dir", metavar="HOST_DIR",
@@ -86447,7 +86930,7 @@ class OpteeShmListCommand(GenericCommand, BufferingOutput):
     """List dynamic shared-memory buffers currently registered in OP-TEE (for OP-TEE v4.3.0~)."""
 
     _cmdline_  = "optee-shm-list"
-    _category_ = "08-g. Qemu-system Cooperation - TrustZone"
+    _category_ = "08-j. Qemu-system Cooperation - TrustZone"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use less.")
@@ -86465,6 +86948,7 @@ class OpteeShmListCommand(GenericCommand, BufferingOutput):
 
         def is_slist_head(addr, head_next, offset):
             current = head_next
+            seen = [current]
             while True:
                 current_next = read_int_from_memory(current + offset)
                 if current_next is None:
@@ -86472,6 +86956,10 @@ class OpteeShmListCommand(GenericCommand, BufferingOutput):
 
                 if current_next == 0:
                     return True
+
+                if current_next in seen:
+                    return False
+                seen.append(current)
 
                 current = current_next
             return False
@@ -86633,7 +87121,7 @@ class OpteeShmListCommand(GenericCommand, BufferingOutput):
     @only_if_specific_gdb_mode(mode=("qemu-system",))
     @only_if_specific_arch(arch=("ARM32", "ARM64"))
     def do_invoke(self, args):
-        maps = PageMap.get_page_maps_by_pagewalk("pagewalk --optee --quiet --no-pager").splitlines()
+        maps = PageMap.get_page_maps_by_pagewalk("pagewalk --optee --quiet --no-pager --disable-color").splitlines()
         if not maps:
             err("Not found memory maps")
             return
@@ -86670,7 +87158,7 @@ class OpteeBgetDumpCommand(GenericCommand, BufferingOutput):
     """Dump bget allocator of OPTEE-Trusted-App."""
 
     _cmdline_ = "optee-bget-dump"
-    _category_ = "08-g. Qemu-system Cooperation - TrustZone"
+    _category_ = "08-j. Qemu-system Cooperation - TrustZone"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ascii diagram.")
@@ -86715,11 +87203,11 @@ class OpteeBgetDumpCommand(GenericCommand, BufferingOutput):
 
     def is_readable_virt_memory(self, addr):
         if is_arm32():
-            res = PageMap.get_page_maps_by_pagewalk("pagewalk -S --quiet --no-pager")
+            res = PageMap.get_page_maps_by_pagewalk("pagewalk -S --quiet --no-pager --disable-color")
             res = sorted(set(res.splitlines()))
             res = list(filter(lambda line: "PL0/RW-" in line, res))
         elif is_arm64():
-            res = PageMap.get_page_maps_by_pagewalk("pagewalk 1 --quiet --no-pager")
+            res = PageMap.get_page_maps_by_pagewalk("pagewalk 1 --quiet --no-pager --disable-color")
             res = sorted(set(res.splitlines()))
             res = list(filter(lambda line: "EL0/RW-" in line, res))
         for line in res:
@@ -86732,10 +87220,10 @@ class OpteeBgetDumpCommand(GenericCommand, BufferingOutput):
 
     def get_ta_rw_address(self, ta_loaded_rx_end):
         if is_arm32():
-            res = PageMap.get_page_maps_by_pagewalk("pagewalk -S --quiet --no-pager")
+            res = PageMap.get_page_maps_by_pagewalk("pagewalk -S --quiet --no-pager --disable-color")
             res = sorted(set(res.splitlines()))
         elif is_arm64():
-            res = PageMap.get_page_maps_by_pagewalk("pagewalk 1 --quiet --no-pager")
+            res = PageMap.get_page_maps_by_pagewalk("pagewalk 1 --quiet --no-pager --disable-color")
             res = sorted(set(res.splitlines()))
         for line in res:
             if not re.search("[PE]L1/RW", line):
@@ -87898,7 +88386,7 @@ class MsrCommand(GenericCommand):
     """Read or write MSR value."""
 
     _cmdline_ = "msr"
-    _category_ = "04-a. Register - View"
+    _category_ = "08-b. Qemu-system Cooperation - Register"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("msr_target", metavar="MSR_NAME|MSR_CONST", nargs="?",
@@ -88060,7 +88548,7 @@ class CetCommand(GenericCommand):
     """Display Intel CET settings."""
 
     _cmdline_ = "cet"
-    _category_ = "04-a. Register - View"
+    _category_ = "08-b. Qemu-system Cooperation - Register"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     _syntax_ = parser.format_help()
@@ -88212,7 +88700,7 @@ class VBARCommand(GenericCommand, BufferingOutput):
     """Pretty-print ARM/ARM64 vector table."""
 
     _cmdline_ = "vbar"
-    _category_ = "04-a. Register - View"
+    _category_ = "08-b. Qemu-system Cooperation - Register"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-a", "--address", type=AddressUtil.parse_address, help="the vector address.")
@@ -88279,17 +88767,11 @@ class VBARCommand(GenericCommand, BufferingOutput):
         vbars = self.get_vbar_arm32()
         max_width = max(len(x[2]) for x in self.A32_VECTOR_NAMES)
 
-        def is_secure():
-            scr = get_register("$SCR")
-            if scr is None:
-                return False
-            return (scr & 0b1) == 0
-
         for regname, vbar in vbars:
             self.out.append(titlify(regname))
 
             # address check
-            if "$VBAR_S" in regname and not is_secure():
+            if "$VBAR_S" in regname and not is_in_secure():
                 vbar_phys = XSecureMemAddrCommand.v2p_secure(vbar)
                 if vbar_phys is None:
                     self.err_add_out("Invalid VBAR address: {:#x}".format(vbar))
@@ -88305,7 +88787,7 @@ class VBARCommand(GenericCommand, BufferingOutput):
             # read each entry
             for ofs, _sz, s in self.A32_VECTOR_NAMES:
                 s = Color.colorify(s.ljust(max_width), "bold")
-                if "$VBAR_S" in regname and not is_secure():
+                if "$VBAR_S" in regname and not is_in_secure():
                     try:
                         code = read_physmem(vbar_phys + ofs, 4)
                     except gdb.MemoryError:
@@ -88562,7 +89044,7 @@ class QemuRegistersCommand(GenericCommand, BufferingOutput):
     """Get registers via qemu-monitor and shows the detail of x64/x86 system registers."""
 
     _cmdline_ = "qreg"
-    _category_ = "08-a. Qemu-system Cooperation - General"
+    _category_ = "08-b. Qemu-system Cooperation - Register"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-v", "--verbose", action="store_true", help="also display detailed bit information.")
@@ -89028,14 +89510,14 @@ class PageMap:
             if FORCE_PREFIX_S is True:
                 return PageMap.get_page_maps_arm64_optee_secure_memory(verbose) # already parsed
             else:
-                res = PageMap.get_page_maps_by_pagewalk("pagewalk 1 --quiet --no-pager --no-merge")
+                res = PageMap.get_page_maps_by_pagewalk("pagewalk 1 --quiet --no-pager --no-merge --disable-color")
         else:
             if FORCE_PREFIX_S is None:
-                res = PageMap.get_page_maps_by_pagewalk("pagewalk --quiet --no-pager --no-merge")
+                res = PageMap.get_page_maps_by_pagewalk("pagewalk --quiet --no-pager --no-merge --disable-color")
             elif FORCE_PREFIX_S is True:
-                res = PageMap.get_page_maps_by_pagewalk("pagewalk -S --quiet --no-pager --no-merge")
+                res = PageMap.get_page_maps_by_pagewalk("pagewalk -S --quiet --no-pager --no-merge --disable-color")
             elif FORCE_PREFIX_S is False:
-                res = PageMap.get_page_maps_by_pagewalk("pagewalk -s --quiet --no-pager --no-merge")
+                res = PageMap.get_page_maps_by_pagewalk("pagewalk -s --quiet --no-pager --no-merge --disable-color")
         res = sorted(set(res.splitlines()))
         res = list(filter(lambda line: line.endswith("]"), res))
         res = list(filter(lambda line: "[+]" not in line, res))
@@ -89082,7 +89564,7 @@ class Virt2PhysCommand(GenericCommand):
     """Transfer from virtual address to physical address."""
 
     _cmdline_ = "v2p"
-    _category_ = "08-a. Qemu-system Cooperation - General"
+    _category_ = "08-d. Qemu-system Cooperation - Virt/Phys/Page"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     group = parser.add_mutually_exclusive_group()
@@ -89126,7 +89608,7 @@ class Phys2VirtCommand(GenericCommand):
     """Transfer from physical address to virtual address."""
 
     _cmdline_ = "p2v"
-    _category_ = "08-a. Qemu-system Cooperation - General"
+    _category_ = "08-d. Qemu-system Cooperation - Virt/Phys/Page"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     group = parser.add_mutually_exclusive_group()
@@ -89183,7 +89665,7 @@ class PagewalkCommand(GenericCommand, BufferingOutput):
     """The base command to dump page tables."""
 
     _cmdline_ = "pagewalk"
-    _category_ = "08-a. Qemu-system Cooperation - General"
+    _category_ = "08-a. Qemu-system Cooperation - Memory Map"
     _aliases_ = ["pw", "ptdump", "pt"]
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
@@ -89419,6 +89901,40 @@ class PagewalkCommand(GenericCommand, BufferingOutput):
             ))
         return
 
+    def add_color(self, lines):
+        for i in range(len(lines)):
+            line = lines[i].split(None, 5)
+            if len(line) < 6:
+                continue
+            if is_x86() or is_riscv32() or is_riscv64():
+                if re.search(r"^\[R-- ", line[5]):
+                    lines[i] = Color.colorify(lines[i], Config.get_gef_setting("theme.address_readonly"))
+                elif re.search(r"^\[..X ", line[5]):
+                    lines[i] = Color.colorify(lines[i], Config.get_gef_setting("theme.address_code"))
+                elif re.search(r"^\[RW- ", line[5]):
+                    lines[i] = Color.colorify(lines[i], Config.get_gef_setting("theme.address_writable"))
+                if re.search(r"^\[RWX ", line[5]):
+                    lines[i] = Color.colorify(lines[i], Config.get_gef_setting("theme.address_rwx"))
+            elif is_arm32():
+                if re.search(r"PL/R--", line[5]):
+                    lines[i] = Color.colorify(lines[i], Config.get_gef_setting("theme.address_readonly"))
+                elif re.search(r"PL1/..X", line[5]):
+                    lines[i] = Color.colorify(lines[i], Config.get_gef_setting("theme.address_code"))
+                elif re.search(r"PL1/RW-", line[5]):
+                    lines[i] = Color.colorify(lines[i], Config.get_gef_setting("theme.address_writable"))
+                if re.search(r"PL1/RWX", line[5]):
+                    lines[i] = Color.colorify(lines[i], Config.get_gef_setting("theme.address_rwx"))
+            elif is_arm64():
+                if re.search(r"EL[1-3]/R--", line[5]):
+                    lines[i] = Color.colorify(lines[i], Config.get_gef_setting("theme.address_readonly"))
+                elif re.search(r"EL[1-3]/..X", line[5]):
+                    lines[i] = Color.colorify(lines[i], Config.get_gef_setting("theme.address_code"))
+                elif re.search(r"EL[1-3]/RW-", line[5]):
+                    lines[i] = Color.colorify(lines[i], Config.get_gef_setting("theme.address_writable"))
+                if re.search(r"EL[1-3]/RWX", line[5]):
+                    lines[i] = Color.colorify(lines[i], Config.get_gef_setting("theme.address_rwx"))
+        return lines
+
     def make_out(self, mappings):
         if mappings is None or len(mappings) == 0:
             self.warn_add_out("No virtual mappings found")
@@ -89472,6 +89988,10 @@ class PagewalkCommand(GenericCommand, BufferingOutput):
         legend = ["Virtual address start-end", "Physical address start-end", "Total size", "Page size", "Count", "Flags"]
         self.out.append(GefUtil.make_legend(fmt.format(*legend)))
 
+        # coloring
+        if not self.args.disable_color:
+            lines = self.add_color(lines)
+
         # add out
         self.out.extend(lines)
         return
@@ -89515,7 +90035,7 @@ class PagewalkRiscvCommand(PagewalkCommand):
     """Dump pagetable for riscv64/32."""
 
     _cmdline_ = "pagewalk riscv"
-    _category_ = "08-a. Qemu-system Cooperation - General"
+    _category_ = "08-a. Qemu-system Cooperation - Memory Map"
     _aliases_ = ["pagewalk riscv32", "pagewalk riscv64"]
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
@@ -89534,6 +90054,7 @@ class PagewalkRiscvCommand(PagewalkCommand):
                         help="filter by map included specified physical address.")
     parser.add_argument("-t", "--trace", metavar="VADDR", action="append", type=AddressUtil.parse_address, default=[],
                         help="show all level pagetables only associated specified address.")
+    parser.add_argument("-D", "--disable-color", action="store_true", help="disable RWX colored output")
     parser.add_argument("-c", "--use-cache", action="store_true", help="use previous result.")
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use less.")
     parser.add_argument("-q", "--quiet", action="store_true", help="show result only.")
@@ -90104,7 +90625,7 @@ class PagewalkX64Command(PagewalkCommand):
     """Dump pagetable for x64/x86."""
 
     _cmdline_ = "pagewalk x64"
-    _category_ = "08-a. Qemu-system Cooperation - General"
+    _category_ = "08-a. Qemu-system Cooperation - Memory Map"
     _aliases_ = ["pagewalk x86"]
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
@@ -90123,8 +90644,8 @@ class PagewalkX64Command(PagewalkCommand):
                         help="filter by map included specified physical address.")
     parser.add_argument("-t", "--trace", metavar="VADDR", action="append", type=AddressUtil.parse_address, default=[],
                         help="show all level pagetables only associated specified address.")
-    parser.add_argument("--include-esp-fixup-stacks", action="store_true",
-                        help="include `%%esp fixup stacks` area (sometimes heavy memory use).")
+    parser.add_argument("-i", "--include-esp-fixup-stacks", action="store_true",
+                        help="include `%%esp fixup stacks` area (sometimes heavy memory use; x64 only).")
     parser.add_argument("-U", "--user-pt", action="store_true",
                         help="print userland pagetables (for KPTI, only x64, in kernel context).")
     parser.add_argument("--cr3", dest="user_specified_cr3", type=AddressUtil.parse_address,
@@ -90132,6 +90653,7 @@ class PagewalkX64Command(PagewalkCommand):
     parser.add_argument("--cr4", dest="user_specified_cr4", type=AddressUtil.parse_address,
                         help="use specified value as cr4.")
     parser.add_argument("--ept", action="store_true", help="parse cr3 as EPT (Extended Page Table).")
+    parser.add_argument("-D", "--disable-color", action="store_true", help="disable RWX colored output")
     parser.add_argument("-c", "--use-cache", action="store_true", help="use previous result.")
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use less.")
     parser.add_argument("-q", "--quiet", action="store_true", help="show result only.")
@@ -90751,6 +91273,10 @@ class PagewalkX64Command(PagewalkCommand):
     @only_if_specific_gdb_mode(mode=("qemu-system", "vmware"))
     @only_if_specific_arch(arch=("x86_32", "x86_64", "x86_16"))
     def do_invoke(self, args):
+        if self.args.include_esp_fixup_stacks and not is_x86_64():
+            err("Unsupported --include-esp-fixup-stacks option in this arch")
+            return
+
         if self.args.trace:
             # You should not modify the self.args.vrange directly.
             self.vrange = self.args.vrange + self.args.trace # merge vrange and trace
@@ -90780,7 +91306,7 @@ class PagewalkArmCommand(PagewalkCommand):
     """Dump pagetable for ARM Cortex-A. PL2 pagewalk is unsupported."""
 
     _cmdline_ = "pagewalk arm"
-    _category_ = "08-a. Qemu-system Cooperation - General"
+    _category_ = "08-a. Qemu-system Cooperation - Memory Map"
     _aliases_ = ["pagewalk arm32"]
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
@@ -90800,6 +91326,7 @@ class PagewalkArmCommand(PagewalkCommand):
     parser.add_argument("-t", "--trace", metavar="VADDR", action="append", type=AddressUtil.parse_address, default=[],
                         help="show all level pagetables only associated specified address.")
     parser.add_argument("--optee", action="store_true", help="show the secure world memory maps if used OP-TEE.")
+    parser.add_argument("-D", "--disable-color", action="store_true", help="disable RWX colored output")
     parser.add_argument("-c", "--use-cache", action="store_true", help="use previous result.")
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use less.")
     parser.add_argument("-q", "--quiet", action="store_true", help="show result only.")
@@ -91790,7 +92317,7 @@ class PagewalkArmCommand(PagewalkCommand):
         return
 
     def arm32_optee_exact_pagewalk(self):
-        res = PageMap.get_page_maps_by_pagewalk("pagewalk arm -S -q -n")
+        res = PageMap.get_page_maps_by_pagewalk("pagewalk arm -S --quiet --no-pager --disable-color")
         if not res:
             return
 
@@ -91923,7 +92450,7 @@ class PagewalkArm64Command(PagewalkCommand):
     """Dump pagetable for ARM64 Cortex-A (ARM v8.7 base)."""
 
     _cmdline_ = "pagewalk arm64"
-    _category_ = "08-a. Qemu-system Cooperation - General"
+    _category_ = "08-a. Qemu-system Cooperation - Memory Map"
     _aliases_ = [] # re-overwrite
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
@@ -91942,6 +92469,7 @@ class PagewalkArm64Command(PagewalkCommand):
     parser.add_argument("-t", "--trace", metavar="VADDR", action="append", type=AddressUtil.parse_address, default=[],
                         help="show all level pagetables only associated specified address.")
     parser.add_argument("--optee", action="store_true", help="show the secure world memory maps if used OP-TEE.")
+    parser.add_argument("-D", "--disable-color", action="store_true", help="disable RWX colored output")
     parser.add_argument("-c", "--use-cache", action="store_true", help="use previous result.")
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use less.")
     parser.add_argument("-q", "--quiet", action="store_true", help="show result only.")
@@ -93833,7 +94361,7 @@ class SwitchELCommand(GenericCommand):
     """Switch EL (Exception Level) on ARM64 architecture."""
 
     _cmdline_ = "switch-el"
-    _category_ = "08-a. Qemu-system Cooperation - General"
+    _category_ = "08-b. Qemu-system Cooperation - Register"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("target_el", metavar="TARGET_EL", nargs="?", type=int,
@@ -93888,21 +94416,32 @@ class PagewalkWithHintsCommand(GenericCommand, BufferingOutput):
     """Add hint to the result of pagewalk."""
 
     _cmdline_ = "pagewalk-with-hints"
-    _category_ = "08-a. Qemu-system Cooperation - General"
+    _category_ = "08-a. Qemu-system Cooperation - Memory Map"
+    _aliases_ = ["kvmmap"]
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
-    parser.add_argument("-s", "--skip-full-slab-cache", action="store_true",
-                        help="skip search full slab cache. use this option if take a long time to parse.")
+    parser.add_argument("-U", "--exclude-user", action="store_true", help="exclude userland memory.")
+    parser.add_argument("-i", "--include-esp-fixup-stacks", action="store_true",
+                        help="include `%%esp fixup stacks` area (sometimes heavy memory use; x64 only).")
+    parser.add_argument("-v", "--verbose", action="count", default=0,
+                        help="increase output verbosity. (-v, -vv, -vvv)")
     parser.add_argument("-n", "--no-pager", action="store_true", help="do not use less.")
-    parser.add_argument("-r", "--rescan", action="store_true", help="do not use map cache.")
     parser.add_argument("-q", "--quiet", action="store_true", help="quiet execution.")
     _syntax_ = parser.format_help()
 
     class Region:
         def __init__(self, addr_start, addr_end, perm, description="", merge=True):
-            self.addr_start = addr_start
-            self.addr_end = addr_end
-            self.size = addr_end - addr_start
+            if isinstance(addr_start, str):
+                self.addr_start = int(addr_start.replace("*", "0"), 16)
+                self.addr_end = int(addr_end.replace("*", "0"), 16)
+                self.espfix = True
+                self.addr_start_str = addr_start
+                self.addr_end_str = addr_end
+            else:
+                self.addr_start = addr_start
+                self.addr_end = addr_end
+                self.espfix = False
+            self.size = self.addr_end - self.addr_start
             self.perm = perm
             self.description = description
             self.merge = merge
@@ -93930,6 +94469,7 @@ class PagewalkWithHintsCommand(GenericCommand, BufferingOutput):
         target_address_start = to_insert_address
         target_address_end = to_insert_address + to_insert_size
 
+        updated = False
         for _key, r in sorted(self.regions.items()):
             # no overwrap
             if r.addr_end <= target_address_start:
@@ -93983,6 +94523,7 @@ class PagewalkWithHintsCommand(GenericCommand, BufferingOutput):
                 addr_start_1st = r.addr_start
                 addr_end_1st = addr_start_1st + size_1st
                 self.regions[addr_start_1st] = self.Region(addr_start_1st, addr_end_1st, r.perm, r.description, merge)
+                updated = True
             if size_2nd > 0:
                 addr_start_2nd = max(target_address_start, r.addr_start)
                 addr_end_2nd = addr_start_2nd + size_2nd
@@ -93994,14 +94535,19 @@ class PagewalkWithHintsCommand(GenericCommand, BufferingOutput):
                 else:
                     new_description = description
                 self.regions[addr_start_2nd] = self.Region(addr_start_2nd, addr_end_2nd, r.perm, new_description, merge)
+                updated = True
             if size_3rd > 0:
                 addr_start_3rd = target_address_end
                 addr_end_3rd = addr_start_3rd + size_3rd
                 self.regions[addr_start_3rd] = self.Region(addr_start_3rd, addr_end_3rd, r.perm, r.description, merge)
+                updated = True
 
             if r.addr_end < target_address_end:
                 target_address_start = r.addr_end
-        return
+        return updated
+
+    def insert_region_range(self, to_insert_address, to_insert_end, description, merge=True):
+        return self.insert_region(to_insert_address, to_insert_end - to_insert_address, description, merge)
 
     def merge_region(self):
         new_regions = {}
@@ -94052,24 +94598,42 @@ class PagewalkWithHintsCommand(GenericCommand, BufferingOutput):
         return
 
     def get_maps(self):
-        res = PageMap.get_page_maps_by_pagewalk("pagewalk --quiet --no-pager")
+        option = ""
+        if self.args.include_esp_fixup_stacks:
+            option = " --include-esp-fixup-stacks"
+        res = PageMap.get_page_maps_by_pagewalk("pagewalk --quiet --no-pager --disable-color" + option)
         res = sorted(set(res.splitlines()))
         res = list(filter(lambda line: line.endswith("]"), res))
         res = list(filter(lambda line: "[+]" not in line, res))
-        res = list(filter(lambda line: "*" not in line, res))
 
         regions = {}
         for line in res:
+            # esp_fixup special handling
+            if is_x86_64() and self.args.include_esp_fixup_stacks and "*" in line:
+                line = line.split()
+                addr_start_str, addr_end_str = line[0].split("-")
+                perm = Permission.from_process_maps(line[5][1:4].lower())
+                addr_start = int(addr_start_str.replace("*", "0"), 16)
+                regions[addr_start] = self.Region(addr_start_str, addr_end_str, str(perm), "esp_fixup", merge=False)
+                continue
+
+            # parse entry
             line = line.split()
             addr_start, addr_end = [int(x, 16) for x in line[0].split("-")]
-            # TODO: more suitable check for kernel address
-            if (addr_start >> ((current_arch.ptrsize * 8) - 1)) != 1:
-                continue
+            if self.args.exclude_user:
+                # TODO: more suitable check for kernel address
+                if not AddressUtil.is_msb_on(addr_start):
+                    continue
             if is_x86():
                 perm = Permission.from_process_maps(line[5][1:4].lower())
             elif is_arm64() or is_arm32():
                 perm = Permission.from_process_maps(line[6][4:7].lower())
-            regions[addr_start] = self.Region(addr_start, addr_end, str(perm))
+
+            # add region
+            if not AddressUtil.is_msb_on(addr_start):
+                regions[addr_start] = self.Region(addr_start, addr_end, str(perm), "userland")
+            else:
+                regions[addr_start] = self.Region(addr_start, addr_end, str(perm))
         return regions
 
     def resolve_kbase(self):
@@ -94118,64 +94682,207 @@ class PagewalkWithHintsCommand(GenericCommand, BufferingOutput):
     def resolve_direct_map(self):
         self.quiet_info("resolve direct map")
 
-        page_offset = KernelAddressHeuristicFinder.get_page_offset()
-        if not page_offset:
-            return
+        if is_x86_64():
+            # try 5-level pagetables
+            r = self.insert_region_range(0xff11_0000_0000_0000, 0xff91_0000_0000_0000, "physmap")
+            if not r:
+                # 4-level pagetables
+                self.insert_region_range(0xffff_8880_0000_0000, 0xffff_c880_0000_0000, "physmap")
+        elif is_arm64():
+            # try 3-level pagetables
+            r = self.insert_region_range(0xfff0_0000_0000_0000, 0xff80_0000_0000_0000, "physmap")
+            if not r:
+                # 4-level pagetables
+                self.insert_region_range(0xffff_0000_0000_0000, 0xffff_8000_0000_0000, "physmap")
+        elif is_arm32() or is_x86_32():
+            # get start address
+            kern_min = Kernel.get_maps()[0][0]
+            if kern_min < 0x8000_0000:
+                PAGE_OFFSET = 0x4000_0000 # VMSPLIT_1G
+            elif kern_min < 0xb000_0000:
+                PAGE_OFFSET = 0x8000_0000 # VMSPLIT_2G
+            elif kern_min < 0xbf00_0000:
+                # 0xbf000000-0xc0000000 is kernel module area.
+                # Even if it is VMSPLIT_3G, this is used.
+                PAGE_OFFSET = 0xb000_0000 # VMSPLIT_3G_OPT
+            else:
+                PAGE_OFFSET = 0xc000_0000 # VMSPLIT_3G
 
-        vmalloc_start = KernelAddressHeuristicFinder.get_vmalloc_start()
-        if not vmalloc_start:
-            return
-
-        phys_page_start = page_offset
-        phys_mem_size = vmalloc_start - phys_page_start
-
-        self.insert_region(phys_page_start, phys_mem_size, "physmem direct map")
+            # get end address
+            mem_map = KernelAddressHeuristicFinder.get_mem_map()
+            if mem_map is None:
+                return
+            mem_map &= gef_getpagesize_mask_high()
+            dir_map_end = mem_map - 8 * 1024 * 1024 # 8MB guard
+            self.insert_region_range(PAGE_OFFSET, dir_map_end, "physmap")
         return
 
     def resolve_vmalloc(self):
         self.quiet_info("resolve vmalloc")
 
-        vmalloc_start = KernelAddressHeuristicFinder.get_vmalloc_start()
-        if not vmalloc_start:
-            return
-
-        cr4 = get_register("cr4", use_monitor=True)
-        if (cr4 >> 12) & 1: # PML5T check
-            VMALLOC_SIZE_TB = 12800
+        if is_x86_64():
+            # try 5-level pagetables
+            r = self.insert_region_range(0xffa0_0000_0000_0000, 0xffd2_0000_0000_0000, "vmalloc")
+            if not r:
+                # 4-level pagetables
+                self.insert_region_range(0xffff_c900_0000_0000, 0xffff_e900_0000_0000, "vmalloc")
+        elif is_arm64():
+            kversion = Kernel.kernel_version()
+            if kversion < "5.11":
+                # Without KASAN, the memory map may differ from the official documentation.
+                kasan = gdb.execute("ksymaddr-remote kasan_ --quiet --no-pager", to_string=True) # do not use --exact
+                is_52bit_range = is_valid_addr(0xfff0_0000_0000_0000)
+                if kasan:
+                    if is_52bit_range:
+                        self.insert_region_range(0xffff_a000_1000_0000, 0xffff_f81f_ffff_0000, "vmalloc")
+                    else:
+                        self.insert_region_range(0xffff_a000_1000_0000, 0xffff_fdff_bfff_0000, "vmalloc")
+                else:
+                    if is_52bit_range:
+                        self.insert_region_range(0xffff_8000_0000_0000, 0xffff_f81f_ffff_0000, "vmalloc")
+                    else:
+                        self.insert_region_range(0xffff_8000_0000_0000, 0xffff_fdff_bfff_0000, "vmalloc")
+            elif kversion < "6.5":
+                self.insert_region_range(0xffff_8000_0800_0000, 0xffff_fbff_f000_0000, "vmalloc")
+            else:
+                self.insert_region_range(0xffff_8000_8000_0000, 0xffff_fbff_f000_0000, "vmalloc")
         else:
-            VMALLOC_SIZE_TB = 32
-
-        vmalloc_region_size = VMALLOC_SIZE_TB << 40
-        self.insert_region(vmalloc_start, vmalloc_region_size, "vmalloc area")
+            res = gdb.execute("vmalloc-dump --quiet --no-pager --only-freed", to_string=True)
+            lines = [Color.remove_color(line) for line in res.splitlines()]
+            if len(lines) > 3:
+                """
+                gef> vmalloc-dump --quiet --no-pager --only-freed
+                #    state  virtual address                       size               flags
+                0    freed  0x0000000000000001-0x00000000f77fe000 0xf77fdfff
+                1    freed  0x00000000f7828000-0x00000000f782a000 0x2000
+                2    freed  0x00000000f7834000-0x00000000f7835000 0x1000
+                3    freed  0x00000000f783b000-0x00000000fefdf000 0x77a4000
+                4    freed  0x00000000feffe000-0x00000000ffffffff 0x1001fff
+                gef>
+                """
+                _, _, vrange, _, *_ = lines[1].split()
+                vmalloc_start = int(vrange.split("-")[1], 16)
+                _, _, vrange, _, *_ = lines[-1].split()
+                vmalloc_end = int(vrange.split("-")[0], 16)
+                self.insert_region_range(vmalloc_start, vmalloc_end, "vmalloc")
+                return
         return
 
-    def resolve_page(self):
+    def resolve_vmemmap(self):
         self.quiet_info("resolve page")
 
         if is_x86_64():
             vmemmap = KernelAddressHeuristicFinder.get_vmemmap()
             if vmemmap is None:
                 return
+            # already there
             if vmemmap in self.regions:
-                self.regions[vmemmap].add_description("struct page area")
-
+                self.regions[vmemmap].add_description("vmemmap(=page[])")
+                return
+            # require division
+            pass
         elif is_x86_32() or is_arm32():
-            # TODO support x86_32 mem_section
             mem_map = KernelAddressHeuristicFinder.get_mem_map()
             if mem_map is None:
                 return
+            mem_map &= gef_getpagesize_mask_high()
+            # already there
             if mem_map in self.regions:
-                self.regions[mem_map].add_description("struct page area")
-
+                self.regions[mem_map].add_description("mem_map(=page[])")
+                return
+            # require division
+            for _key, r in sorted(self.regions.items()):
+                if r.addr_start <= mem_map < r.addr_end:
+                    size = r.addr_end - mem_map
+                    self.insert_region(mem_map, size, "mem_map(=page[])")
+                    return
+            # TODO support x86_32 mem_section
         elif is_arm64():
-            VMEMMAP_START, _ = KernelAddressHeuristicFinder.get_VMEMMAP_START()
-            # It will shift due to KASLR, so we will correct it.
-            for key in sorted(self.regions.keys()):
-                if key >= VMEMMAP_START:
-                    self.regions[key].add_description("struct page area")
+            kversion = Kernel.kernel_version()
+            if kversion < "5.11":
+                is_52bit_range = is_valid_addr(0xfff0_0000_0000_0000)
+                if is_52bit_range:
+                    self.insert_region_range(0xffff_fc1f_ffe0_0000, 0xffff_ffff_ffe0_0000, "vmemmap(=page[])")
+                else:
+                    self.insert_region_range(0xffff_fdff_ffe0_0000, 0xffff_ffff_ffe0_0000, "vmemmap(=page[])")
+            else:
+                self.insert_region_range(0xffff_fc00_0000_0000, 0xffff_fe00_0000_0000, "vmemmap(=page[])")
+        return
+
+    def resolve_cpu_entry(self):
+        if is_arm64() or is_arm32() or is_x86_32():
+            return
+
+        self.quiet_info("resolve cpu entry")
+        if is_x86_64():
+            self.insert_region_range(0xffff_fe00_0000_0000, 0xffff_fe80_0000_0000, "cpu_entry")
+        return
+
+    def resolve_fixmap(self):
+        if is_x86_32():
+            return
+
+        self.quiet_info("resolve fixmap")
+        if is_x86_64():
+            self.insert_region_range(0xffff_ffff_ff50_0000, 0xffff_ffff_ff60_0000, "fixmap")
+        elif is_arm64():
+            kversion = Kernel.kernel_version()
+            if kversion < "5.11":
+                is_52bit_range = is_valid_addr(0xfff0_0000_0000_0000)
+                if is_52bit_range:
+                    self.insert_region_range(0xffff_fc1f_fe59_0000, 0xffff_fc1f_fea0_0000, "fixmap")
+                else:
+                    self.insert_region_range(0xffff_fdff_fe5f_9000, 0xffff_fdff_fea0_0000, "fixmap")
+            else:
+                self.insert_region_range(0xffff_fbff_f000_0000, 0xffff_fbff_fe00_0000, "fixmap")
+        elif is_arm32():
+            kversion = Kernel.kernel_version()
+            if kversion < "3.16":
+                self.insert_region_range(0xfff0_0000, 0xfffe_0000, "fixmap")
+            elif kversion < "3.19":
+                self.insert_region_range(0xffc0_0000, 0xffe0_0000, "fixmap")
+            elif kversion < "5.4":
+                self.insert_region_range(0xffc0_0000, 0xfff0_0000, "fixmap")
+            else:
+                self.insert_region_range(0xffc8_0000, 0xfff0_0000, "fixmap")
+        return
+
+    def resolve_pci(self):
+        if is_x86_64() or is_x86_32():
+            return
+
+        self.quiet_info("resolve pci")
+        if is_arm64():
+            kversion = Kernel.kernel_version()
+            if kversion < "5.11":
+                is_52bit_range = is_valid_addr(0xfff0_0000_0000_0000)
+                if is_52bit_range:
+                    self.insert_region_range(0xffff_fc1f_fec0_0000, 0xffff_fc1f_ffc0_0000, "pci")
+                else:
+                    self.insert_region_range(0xffff_fdff_fec0_0000, 0xffff_fdff_ffc0_0000, "pci")
+            else:
+                self.insert_region_range(0xffff_fbff_fe80_0000, 0xffff_fbff_ff80_0000, "pci")
+        elif is_arm32():
+            kversion = Kernel.kernel_version()
+            if kversion < "3.7":
+                pass
+            else:
+                self.insert_region_range(0xfee0_0000, 0xff00_0000, "pci")
+        return
+
+    def resolve_vector(self):
+        if is_x86_64() or is_x86_32() or is_arm64():
+            return
+
+        self.quiet_info("resolve vector")
+        if is_arm32():
+            self.insert_region_range(0xffff_0000, 0xffff_1000, "vector")
         return
 
     def resolve_buddy(self):
+        if self.args.verbose < 1:
+            self.quiet_warn("resolve buddy: skipped (args.verbose < 1)")
+            return
         self.quiet_info("resolve buddy")
 
         res = gdb.execute("buddy-dump --quiet --no-pager --sort", to_string=True)
@@ -94227,15 +94934,58 @@ class PagewalkWithHintsCommand(GenericCommand, BufferingOutput):
             elems = line.split()
             pid, kstack = int(elems[3]), int(elems[-2], 16)
             process_name = line.split(maxsplit=4)[4][:16].strip()
-            description = "kernel stack of PID:{:d} ({:s})".format(pid, process_name)
+            description = "kstack PID:{:d} ({:s})".format(pid, process_name)
             self.insert_region(kstack, kstack_size, description)
         return
 
-    def resolve_more_slub(self):
-        if self.args.skip_full_slab_cache:
+    def resolve_userland(self):
+        self.quiet_info("resolve userland")
+
+        # If current is a kernel thread, the userland memory map details will not be displayed.
+        # Even if you are in a kernel thread, you may be able to see the userland memory map,
+        # but it takes time to identify which process it belongs to.
+        try:
+            th_num = gdb.selected_thread().num
+            res = gdb.execute("kcurrent --quiet", to_string=True)
+            r = re.search(r"current \(cpu{:d}\): (0x\S+) .*".format(th_num - 1), res)
+            if not r:
+                return
+            curr_task = int(r.group(1), 16)
+        except Exception:
             return
 
-        self.quiet_info("resolve slub (search for full slab cache; skip if target region size >= 0x200000)")
+        res = gdb.execute(f"ktask --quiet --no-pager -u --task-filter {curr_task:#x}", to_string=True)
+        if not res:
+            return
+
+        res = gdb.execute(f"ktask --quiet --no-pager -u --task-filter {curr_task:#x} -m", to_string=True)
+        pid = -1
+        comm = "?"
+        for line in res.splitlines():
+            if not line.startswith("0x"):
+                continue
+            line = line.split()
+
+            # process name
+            if "-" not in line[0]:
+                pid, comm = int(line[3]), line[4]
+                continue
+
+            # map name
+            addr_start, addr_end = line[0].split("-")
+            addr_start = int(addr_start, 16)
+            addr_end = int(addr_end, 16)
+            map_size = addr_end - addr_start
+            description = "PID:{:d} ({:s}) {:s}".format(pid, comm, " ".join(line[2:]))
+            self.insert_region(addr_start, map_size, description.rstrip())
+        return
+
+    def resolve_full_slub(self):
+        if self.args.verbose < 2:
+            self.quiet_warn("resolve full slub: skipped (args.verbose < 2)")
+            return
+
+        self.quiet_info("resolve full slub (skip if target region size >= 0x200000)")
         old_regions = list(self.regions.items())[::]
 
         tqdm = GefUtil.get_tqdm()
@@ -94278,6 +95028,9 @@ class PagewalkWithHintsCommand(GenericCommand, BufferingOutput):
         return
 
     def resolve_slub(self):
+        if self.args.verbose < 1:
+            self.quiet_warn("resolve slub: skipped (args.verbose < 1)")
+            return
         self.quiet_info("resolve slub")
 
         res = gdb.execute("slub-dump --quiet --no-pager -vv", to_string=True)
@@ -94301,10 +95054,13 @@ class PagewalkWithHintsCommand(GenericCommand, BufferingOutput):
                 address, size = None, None # for detect logic error. name will be reused until next parsing
                 continue
 
-        self.resolve_more_slub()
+        self.resolve_full_slub()
         return
 
     def resolve_slab(self):
+        if self.args.verbose < 1:
+            self.quiet_warn("resolve slab: skipped (args.verbose < 1)")
+            return
         self.quiet_info("resolve slab")
 
         res = gdb.execute("slab-dump --quiet --no-pager", to_string=True)
@@ -94330,6 +95086,9 @@ class PagewalkWithHintsCommand(GenericCommand, BufferingOutput):
         return
 
     def resolve_slob(self):
+        if self.args.verbose < 1:
+            self.quiet_warn("resolve slob: skipped (args.verbose < 1)")
+            return
         self.quiet_info("resolve slob")
 
         res = gdb.execute("slob-dump --quiet --no-pager", to_string=True)
@@ -94351,6 +95110,9 @@ class PagewalkWithHintsCommand(GenericCommand, BufferingOutput):
         return
 
     def resolve_slub_tiny(self):
+        if self.args.verbose < 1:
+            self.quiet_warn("resolve slub-tiny: skipped (args.verbose < 1)")
+            return
         self.quiet_info("resolve slub-tiny")
 
         res = gdb.execute("slub-tiny-dump --quiet --no-pager", to_string=True)
@@ -94403,6 +95165,9 @@ class PagewalkWithHintsCommand(GenericCommand, BufferingOutput):
         return
 
     def resolve_vdso(self):
+        if self.args.verbose < 1:
+            self.quiet_warn("resolve vdso: skipped (args.verbose < 1)")
+            return
         self.quiet_info("resolve vdso")
 
         if is_x86_64():
@@ -94440,6 +95205,9 @@ class PagewalkWithHintsCommand(GenericCommand, BufferingOutput):
         return
 
     def resolve_device_physmem(self):
+        if self.args.verbose < 2:
+            self.quiet_warn("resolve device physmem: skipped (args.verbose < 2)")
+            return
         self.quiet_info("resolve device physmem")
 
         try:
@@ -94528,55 +95296,62 @@ class PagewalkWithHintsCommand(GenericCommand, BufferingOutput):
     @only_if_gdb_running
     @only_if_specific_gdb_mode(mode=("qemu-system", "vmware"))
     @only_if_specific_arch(arch=("x86_64", "x86_32", "ARM64", "ARM32"))
+    @only_if_in_kernel_or_kpti_disabled
     def do_invoke(self, args):
-        if not hasattr(self, "out"):
-            self.out = []
+        if self.args.include_esp_fixup_stacks and not is_x86_64():
+            err("Unsupported --include-esp-fixup-stacks option in this arch")
+            return
 
-        if args.rescan:
-            self.out = []
+        # initial regions
+        self.regions = self.get_maps()
 
-        if not self.out:
-            self.add_legend()
+        # add info
+        self.out = []
+        self.add_legend()
+        self.resolve_direct_map()
+        self.resolve_vmalloc()
+        self.resolve_kbase()
+        self.resolve_vmemmap()
+        self.resolve_cpu_entry()
+        self.resolve_fixmap()
+        self.resolve_pci()
+        self.resolve_vector()
+        self.resolve_device_physmem()
+        self.resolve_buddy()
+        self.resolve_kstack()
+        self.resolve_userland()
+        self.resolve_each_slab()
+        self.resolve_module()
+        self.resolve_vdso()
+        self.detect_zero_page()
 
-            # initial regions
-            self.regions = self.get_maps()
-
-            # add info
-            self.resolve_kbase()
-            if is_x86_64():
-                self.resolve_direct_map()
-                self.resolve_vmalloc()
-            self.resolve_page()
-            self.resolve_device_physmem()
-            self.resolve_buddy()
-            self.resolve_kstack()
-            self.resolve_each_slab()
-            self.resolve_module()
-            self.resolve_vdso()
-            self.detect_zero_page()
-
-            # make output
-            self.merge_region()
-            for _, r in sorted(self.regions.items()):
-                # make line
+        # make output
+        self.merge_region()
+        for _, r in sorted(self.regions.items()):
+            # make line
+            if r.espfix:
+                line = "{:18s}-{:18s} {:#018x} [{:s}] {:s}".format(
+                    r.addr_start_str, r.addr_end_str, r.size, r.perm, r.description,
+                ).rstrip()
+            else:
                 line = "{:#018x}-{:#018x} {:#018x} [{:s}] {:s}".format(
                     r.addr_start, r.addr_end, r.size, r.perm, r.description,
-                )
+                ).rstrip()
 
-                # coloring
-                if r.perm == "r--":
-                    line_color = Config.get_gef_setting("theme.address_readonly")
-                elif r.perm == "rw-":
-                    line_color = Config.get_gef_setting("theme.address_writable")
-                elif r.perm.endswith("x"):
-                    line_color = Config.get_gef_setting("theme.address_code")
-                else:
-                    line_color = ""
+            # coloring
+            if r.perm == "r--":
+                line_color = Config.get_gef_setting("theme.address_readonly")
+            elif r.perm == "rw-":
+                line_color = Config.get_gef_setting("theme.address_writable")
+            elif r.perm.endswith("x"):
+                line_color = Config.get_gef_setting("theme.address_code")
+            else:
+                line_color = ""
 
-                if r.perm == "rwx":
-                    line_color += " " + Config.get_gef_setting("theme.address_rwx")
+            if r.perm == "rwx":
+                line_color += " " + Config.get_gef_setting("theme.address_rwx")
 
-                self.out.append(Color.colorify(line, line_color))
+            self.out.append(Color.colorify(line, line_color))
 
         self.print_output()
         return
@@ -94587,9 +95362,10 @@ class PageCommand(GenericCommand):
     """Converts between virtual addresses, physical addresses, and page addresses."""
 
     _cmdline_ = "page"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-d. Qemu-system Cooperation - Virt/Phys/Page"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
+    parser.add_argument("-hh", "--help-simple", action="store_true", help="show help without ascii diagram.")
     modes = ["to_virt", "to_phys", "from_virt", "from_phys"]
     parser.add_argument("mode", choices=modes, help="conversion mode.")
     parser.add_argument("address", metavar="ADDRESS", type=AddressUtil.parse_address,
@@ -95112,7 +95888,7 @@ class Page2VirtCommand(GenericCommand):
     """Transfer from page to virtual address (shortcut for `page to_virt ...`)."""
 
     _cmdline_ = "page2virt"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-d. Qemu-system Cooperation - Virt/Phys/Page"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("page", metavar="ADDRESS", type=AddressUtil.parse_address,
@@ -95136,7 +95912,7 @@ class Virt2PageCommand(GenericCommand):
     """Transfer from virtual address to page (shortcut for `page from_virt ...`)."""
 
     _cmdline_ = "virt2page"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-d. Qemu-system Cooperation - Virt/Phys/Page"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("virt", metavar="ADDRESS", type=AddressUtil.parse_address,
@@ -95160,7 +95936,7 @@ class Page2PhysCommand(GenericCommand):
     """Transfer from page to physical address (shortcut for `page to_phys ...`)."""
 
     _cmdline_ = "page2phys"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-d. Qemu-system Cooperation - Virt/Phys/Page"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("page", metavar="ADDRESS", type=AddressUtil.parse_address,
@@ -95184,7 +95960,7 @@ class Phys2PageCommand(GenericCommand):
     """Transfer from physical address to page (shortcut for `page from_phys ...`)."""
 
     _cmdline_ = "phys2page"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-d. Qemu-system Cooperation - Virt/Phys/Page"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("phys", metavar="ADDRESS", type=AddressUtil.parse_address,
@@ -95208,7 +95984,7 @@ class SlabVirtualCommand(GenericCommand):
     """Converts between slab-virtual addresses and page addresses."""
 
     _cmdline_ = "slab-virtual"
-    _category_ = "08-d. Qemu-system Cooperation - Linux Advanced"
+    _category_ = "08-d. Qemu-system Cooperation - Virt/Phys/Page"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     modes = ["to_virt", "to_page", "from_virt", "from_page"]
@@ -95480,7 +96256,7 @@ class QemuDeviceInfoCommand(GenericCommand, BufferingOutput):
     """Dump device information for qemu-escape."""
 
     _cmdline_ = "qemu-device-info"
-    _category_ = "08-h. Qemu-system Cooperation - Other"
+    _category_ = "08-k. Qemu-system Cooperation - Other"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-d", "--device", help="device name.")
@@ -96629,11 +97405,8 @@ class ExecUntilSecureWorldCommand(ExecUntilCommand):
         super().__init__(prefix=False)
         return
 
-    def is_target_insn(self, insn):
-        scr = get_register("$SCR" if is_arm32() else "$SCR_EL3")
-        if scr is None:
-            return False
-        return (scr & 0b1) == 0
+    def is_target_insn(self, _insn):
+        return is_in_secure()
 
     @parse_args
     @only_if_gdb_running
@@ -96642,9 +97415,8 @@ class ExecUntilSecureWorldCommand(ExecUntilCommand):
     def do_invoke(self, args):
         self.args.skip_lib = False
 
-        scr = get_register("$SCR" if is_arm32() else "$SCR_EL3")
-        if scr is None:
-            err("Not found {:s}".format("$SCR" if is_arm32() else "$SCR_EL3"))
+        if not is_support_secure_world():
+            err("Not found secure-world")
             return
 
         self.exec_next()
@@ -96822,7 +97594,7 @@ class UsermodehelperTracerCommand(GenericCommand):
     """Collect and display information that is executed by call_usermodehelper_setup."""
 
     _cmdline_ = "usermodehelper-tracer"
-    _category_ = "08-f. Qemu-system Cooperation - Linux Dynamic Inspection"
+    _category_ = "08-i. Qemu-system Cooperation - Linux Dynamic Inspection"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     _syntax_ = parser.format_help()
@@ -96920,7 +97692,7 @@ class ThunkTracerCommand(GenericCommand):
     """Collect and display the thunk addresses that are called automatically (only x64/x86)."""
 
     _cmdline_ = "thunk-tracer"
-    _category_ = "08-f. Qemu-system Cooperation - Linux Dynamic Inspection"
+    _category_ = "08-i. Qemu-system Cooperation - Linux Dynamic Inspection"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     _syntax_ = parser.format_help()
@@ -97120,7 +97892,7 @@ class KmallocTracerCommand(GenericCommand):
     """Collect and display information when kmalloc/kfree."""
 
     _cmdline_ = "kmalloc-tracer"
-    _category_ = "08-f. Qemu-system Cooperation - Linux Dynamic Inspection"
+    _category_ = "08-i. Qemu-system Cooperation - Linux Dynamic Inspection"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-f", "--filter", default=[], help="filter specified name (e.g., kmalloc-XX)")
@@ -97556,7 +98328,7 @@ class KmallocAllocatedByCommand(GenericCommand):
     """Call predefined system-calls and prints kmalloc-N chunks allocated and freed (only x64)."""
 
     _cmdline_ = "kmalloc-allocated-by"
-    _category_ = "08-f. Qemu-system Cooperation - Linux Dynamic Inspection"
+    _category_ = "08-i. Qemu-system Cooperation - Linux Dynamic Inspection"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("-f", "--filter", default=[], help="filter specified name (e.g., kmalloc-XX)")
@@ -99101,7 +99873,7 @@ class KernelTraceCommand(GenericCommand):
     """Trace kernel functions and arguments."""
 
     _cmdline_ = "ktrace"
-    _category_ = "08-f. Qemu-system Cooperation - Linux Dynamic Inspection"
+    _category_ = "08-i. Qemu-system Cooperation - Linux Dynamic Inspection"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     parser.add_argument("--task-name", action="append", default=[],
@@ -99236,7 +100008,7 @@ class UefiOvmfInfoCommand(GenericCommand):
     # https://github.com/tianocore/edk2/blob/master/MdeModulePkg/Universal/BdsDxe/BdsEntry.c
     # https://uefi.org/sites/default/files/resources/UEFI_Spec_2_8_final.pdf
     _cmdline_ = "uefi-ovmf-info"
-    _category_ = "08-h. Qemu-system Cooperation - Other"
+    _category_ = "08-k. Qemu-system Cooperation - Other"
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
     _syntax_ = parser.format_help()
@@ -99914,7 +100686,7 @@ class KsymaddrRemoteApplyCommand(GenericCommand):
     """Apply symbol from kallsyms in memory."""
 
     _cmdline_ = "ksymaddr-remote-apply"
-    _category_ = "08-c. Qemu-system Cooperation - Linux Symbol"
+    _category_ = "08-e. Qemu-system Cooperation - Linux Symbol/Type"
     _aliases_ = ["ks-apply"]
 
     parser = argparse.ArgumentParser(prog=_cmdline_)
@@ -102537,12 +103309,14 @@ class GefStatusCommand(GenericCommand):
         gef_print("{:30s}  ->  {!s}".format("is_qiling()", is_qiling()))
         gef_print("{:30s}  ->  {!s}".format("is_vmware()", is_vmware()))
         gef_print("{:30s}  ->  {!s}".format("is_in_kernel()", is_in_kernel()))
+        gef_print("{:30s}  ->  {!s}".format("is_in_secure()", is_in_secure()))
         gef_print("{:30s}  ->  {!s}".format("is_rr()", is_rr()))
         gef_print("{:30s}  ->  {!s}".format("is_wine()", is_wine()))
 
         gef_print(titlify("Others"))
         gef_print("{:30s}  ->  {!s}".format("is_alive()", is_alive()))
         gef_print("{:30s}  ->  {!s}".format("is_kvm_enabled()", is_kvm_enabled()))
+        gef_print("{:30s}  ->  {!s}".format("is_support_secure_world()", is_support_secure_world()))
         gef_print("{:30s}  ->  {!s}".format("is_supported_physmode()", is_supported_physmode()))
         if is_supported_physmode():
             gef_print("{:30s}  ->  {!s}".format("get_current_mmu_mode()", QemuMonitor.get_current_mmu_mode()))

@@ -137,6 +137,10 @@ For a comprehensive list and additional details, see [docs/SUPPORTED-MODE.md](do
     - `vmlinux-to-elf-apply` and `ksymaddr-remote-apply` provide almost the same functionality.
         - `vmlinux-to-elf-apply`: Requires installation of external tools. Create `vmlinux` with symbols.
         - `ksymaddr-remote-apply`: Requires no external tools. Create a blank ELF with only embedded symbols.
+- `ktypes`: displays kernel type information from scanning kernel memory.
+    - ![](images/ktypes.png)
+- `ktypes-load`: loads kernel type information from scanning kernel memory.
+    - ![](images/ktypes-load.png)
 - `slub-dump`: dumps slub free-list.
     - Supported on x64/x86/ARM64/ARM + `SLUB` + no-symbol + kASLR.
     - Supported regardless of whether `CONFIG_SLAB_FREELIST_HARDENED` is `y` or `n`.
@@ -630,6 +634,8 @@ For a comprehensive list and additional details, see [docs/SUPPORTED-MODE.md](do
     - ![](images/hash.png)
 - `crc`: calculates various CRCs.
     - ![](images/crc.png)
+- `json`: pretty prints json.
+    - ![](images/json.png)
 - `base-n-decode`/`base-n-encode`: decodes/encodes various baseN.
     - ![](images/base-n-decode.png)
 - `morse-decode`/`morse-encode`: decodes/encodes morse code.
